@@ -325,16 +325,21 @@ def search_mouser(part_number, api_key):
         for pb in p.get("PriceBreaks", []):
             try:
                 qty = int(pb.get("Quantity", 0))
-                price = safe_float(
-                    str(pb.get("Price", "0"))
-                    .replace("$", "")
-                    .replace(",", "")
-                )
-
+                raw_price = str(pb.get("Price", "") or "").strip().replace("$", "").replace(",", "").replace(" ", "")
+                price = safe_float(raw_price if raw_price else "0")
                 if qty > 0 and pd.notna(price) and price > 0:
                     price_breaks.append({"qty": qty, "price": price})
             except Exception as e:
                 print(f"[MOUSER] ⚠️ PriceBreak parse error: {e}")
+
+        # Fallback: if no price breaks, try top-level UnitPrice field
+        if not price_breaks:
+            unit_price_raw = str(p.get("UnitPrice", "") or "").strip().replace("$", "").replace(",", "").replace(" ", "")
+            unit_price = safe_float(unit_price_raw)
+            moq = int(safe_float(p.get("Min", "1"), default=1))
+            if pd.notna(unit_price) and unit_price > 0:
+                price_breaks.append({"qty": moq, "price": unit_price})
+                print(f"[MOUSER] ⚠️ Used UnitPrice fallback: qty={moq}, price={unit_price}")
 
         print(f"[MOUSER] Pricing tiers found: {price_breaks}")
 
@@ -344,7 +349,7 @@ def search_mouser(part_number, api_key):
         print(f"[MOUSER] Lead time raw='{raw_lt}' → {lt_days} days")
 
         # ───────────── Lifecycle ─────────────
-        eol = p.get("LifecycleStatus", "").upper()
+        eol = (p.get("LifecycleStatus") or "").upper()
         is_eol = any(
             x in eol
             for x in ["OBSOLETE", "EOL", "DISCONTINUED", "NOT RECOMMENDED"]
@@ -434,8 +439,8 @@ def search_nexar(part_number, client_id, client_secret, _token_cache):
     # ───────────────── GraphQL query ─────────────────
     query = """
     query Search($q: String!) {
-      supSearch(q: $q, limit: 1) {
-        hits {
+      supSearchMpn(q: $q, limit: 1) {
+        results {
           part {
             mpn
             shortDescription
@@ -473,17 +478,25 @@ def search_nexar(part_number, client_id, client_secret, _token_cache):
         hits = (
             response_json
             .get("data", {})
-            .get("supSearch", {})
-            .get("hits", [])
+            .get("supSearchMpn", {})
+            .get("results", [])
         )
 
         print(f"[NEXAR] Hits returned: {len(hits)}")
+
+        # Surface any GraphQL errors for easier debugging
+        if response_json.get("errors"):
+            print(f"[NEXAR] ❌ GraphQL errors: {response_json['errors']}")
+            return None
 
         if not hits:
             print("[NEXAR] ❌ No hits found for part")
             return None
 
-        part_data = hits[0]["part"]
+        part_data = hits[0].get("part") if hits[0] else None
+        if not part_data:
+            print("[NEXAR] ❌ First hit has no part data")
+            return None
         sellers = part_data.get("sellers", [])
         print(f"[NEXAR] Sellers found: {len(sellers)}")
 
@@ -557,7 +570,7 @@ def search_nexar(part_number, client_id, client_secret, _token_cache):
             "Source": best_seller or "Octopart (Nexar)",
             "SourcePartNumber": best_offer.get("sku", "N/A"),
             "ManufacturerPartNumber": part_data.get("mpn", part_number),
-            "Manufacturer": part_data.get("manufacturer", {}).get("name", "N/A"),
+            "Manufacturer": (part_data.get("manufacturer") or {}).get("name", "N/A"),
             "Description": part_data.get("shortDescription", ""),
             "Stock": int(safe_float(best_offer.get("inventoryLevel", 0), default=0)),
             "LeadTimeDays": lt_days,
@@ -567,9 +580,7 @@ def search_nexar(part_number, client_id, client_secret, _token_cache):
             "NormallyStocking": True,
             "Discontinued": False,
             "EndOfLife": False,
-            "DatasheetUrl": part_data.get("bestDatasheet", {}).get("url", "")
-            if isinstance(part_data.get("bestDatasheet"), dict)
-            else "",
+            "DatasheetUrl": (part_data.get("bestDatasheet") or {}).get("url", ""),
         }
 
     except Exception as e:
@@ -1088,8 +1099,8 @@ if uploaded:
             valid_results = [r for r in results if r.get("_valid")]
 
             # KPI metrics
-            total_cost_best   = sum(r.get("BestTotalCostRaw", 0) or 0 for r in valid_results)
-            total_cost_tariff = sum(r.get("BestTotalWithTariff", 0) or 0 for r in valid_results)
+            total_cost_best   = sum(v for r in valid_results if pd.notna(v := r.get("BestTotalCostRaw") or 0))
+            total_cost_tariff = sum(v for r in valid_results if pd.notna(v := r.get("BestTotalWithTariff") or 0))
             tariff_impact     = total_cost_tariff - total_cost_best
             high_risk   = sum(1 for r in results if r.get("RiskScore",0) >= 6.6)
             mod_risk    = sum(1 for r in results if 3.6 <= r.get("RiskScore",0) < 6.6)
@@ -1166,7 +1177,7 @@ if uploaded:
                     res_df = res_df[res_df["Risk Score"] < 3.6]
 
                 styled = res_df.style\
-                    .applymap(color_risk_cell, subset=["Risk Score"])\
+                    .map(color_risk_cell, subset=["Risk Score"])\
                     .format({
                         "Unit Cost ($)":  lambda v: f"${v:.4f}" if pd.notna(v) else "N/A",
                         "Total Cost ($)": lambda v: f"${v:,.2f}" if pd.notna(v) else "N/A",
@@ -1192,7 +1203,7 @@ if uploaded:
                             "COO":         r["COO"],
                         })
                     rf_df = pd.DataFrame(rf_rows)
-                    st.dataframe(rf_df.style.applymap(color_risk_cell, subset=["Overall Risk"]),
+                    st.dataframe(rf_df.style.map(color_risk_cell, subset=["Overall Risk"]),
                                  use_container_width=True)
 
                 # Export
@@ -1286,7 +1297,7 @@ if uploaded:
 
                 if chart_type == "Risk Score Distribution":
                     bins   = [0, 3.5, 6.5, 10]
-                    labels = ["🟢 Low (0–3.5)", "🟡 Moderate (3.6–6.5)", "🔴 High (6.6–10)"]
+                    labels = ["Low (0-3.5)", "Moderate (3.6-6.5)", "High (6.6-10)"]
                     colors = ["#107c10","#ca5010","#d13438"]
                     counts = [
                         sum(1 for r in results if r.get("RiskScore",0) <= 3.5),
