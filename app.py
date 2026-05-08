@@ -288,7 +288,7 @@ def search_mouser(part_number, api_key):
     payload = {
         "SearchByPartRequest": {
             "mouserPartNumber": part_number,
-            "partSearchOptions": "string"
+            "partSearchOptions": "Exact"
         }
     }
 
@@ -333,15 +333,60 @@ def search_mouser(part_number, api_key):
                 print(f"[MOUSER] ⚠️ PriceBreak parse error: {e}")
 
         # Fallback: if no price breaks, try top-level UnitPrice field
+        # Fallback 1: top-level UnitPrice field
         if not price_breaks:
             unit_price_raw = str(p.get("UnitPrice", "") or "").strip().replace("$", "").replace(",", "").replace(" ", "")
             unit_price = safe_float(unit_price_raw)
             moq = int(safe_float(p.get("Min", "1"), default=1))
             if pd.notna(unit_price) and unit_price > 0:
                 price_breaks.append({"qty": moq, "price": unit_price})
-                print(f"[MOUSER] ⚠️ Used UnitPrice fallback: qty={moq}, price={unit_price}")
+                print(f"[MOUSER] UnitPrice fallback: {moq}x${unit_price}")
 
-        print(f"[MOUSER] Pricing tiers found: {price_breaks}")
+        # Fallback 2: keyword search endpoint — returns pricing when partnumber endpoint doesn't
+        if not price_breaks:
+            try:
+                kw_url = "https://api.mouser.com/api/v1/search/keyword"
+                kw_payload = {
+                    "SearchByKeywordRequest": {
+                        "keyword": part_number,
+                        "records": 5,
+                        "startingRecord": 0,
+                        "searchOptions": "",
+                        "searchWithYourSignUpLanguage": ""
+                    }
+                }
+                kw_r = requests.post(kw_url, params={"apiKey": api_key}, json=kw_payload, timeout=API_TIMEOUT)
+                kw_r.raise_for_status()
+                kw_parts = kw_r.json().get("SearchResults", {}).get("Parts", [])
+                # Find best matching part from keyword results
+                kw_match = None
+                for kp in kw_parts:
+                    if kp.get("ManufacturerPartNumber", "").upper() == part_number.upper():
+                        kw_match = kp
+                        break
+                if kw_match is None and kw_parts:
+                    kw_match = kw_parts[0]
+                if kw_match:
+                    for pb in (kw_match.get("PriceBreaks") or []):
+                        try:
+                            qty = int(pb.get("Quantity", 0) or 0)
+                            raw_p = str(pb.get("Price", "") or "").strip().replace("$","").replace(",","").replace(" ","")
+                            price = safe_float(raw_p)
+                            if qty > 0 and pd.notna(price) and price > 0:
+                                price_breaks.append({"qty": qty, "price": price})
+                        except:
+                            pass
+                    if price_breaks:
+                        print(f"[MOUSER] Keyword fallback got {len(price_breaks)} price breaks")
+                    else:
+                        # Last resort: UnitPrice from keyword result
+                        kw_up = safe_float(str(kw_match.get("UnitPrice","") or "").replace("$","").replace(",","").strip())
+                        kw_moq = max(1, int(safe_float(kw_match.get("Min","1"), default=1)))
+                        if pd.notna(kw_up) and kw_up > 0:
+                            price_breaks.append({"qty": kw_moq, "price": kw_up})
+                            print(f"[MOUSER] Keyword UnitPrice fallback: {kw_moq}x${kw_up}")
+            except Exception as e:
+                print(f"[MOUSER] Keyword fallback error: {e}")
 
         # ───────────── Lead time ─────────────
         raw_lt = p.get("LeadTime", "")
@@ -401,7 +446,7 @@ def search_nexar(part_number, client_id, client_secret, _token_cache):
         print("[NEXAR] ❌ Missing client_id or client_secret")
         return None
 
-    # ───────────────── Token handling ─────────────────
+    # ── Token handling ──────────────────────────────────────────────────────
     now = time.time()
     if _token_cache.get("expires_at", 0) > now + 60:
         token = _token_cache["access_token"]
@@ -413,33 +458,31 @@ def search_nexar(part_number, client_id, client_secret, _token_cache):
                 "https://identity.nexar.com/connect/token",
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 data={
-                    "grant_type": "client_credentials",
-                    "client_id": client_id,
+                    "grant_type":    "client_credentials",
+                    "client_id":     client_id,
                     "client_secret": client_secret,
-                    "scope": "supply.domain",
+                    "scope":         "supply.domain",
                 },
                 timeout=API_TIMEOUT,
             )
             print(f"[NEXAR] OAuth HTTP status: {tr.status_code}")
             tr.raise_for_status()
             td = tr.json()
-
             token = td.get("access_token")
             if not token:
-                print(f"[NEXAR] ❌ OAuth response missing access_token: {td}")
+                print(f"[NEXAR] ❌ No access_token in response: {td}")
                 return None
-
             _token_cache["access_token"] = token
-            _token_cache["expires_at"] = now + td.get("expires_in", 3600) - 60
+            _token_cache["expires_at"]   = now + td.get("expires_in", 3600) - 60
             print("[NEXAR] ✅ OAuth token acquired and cached")
         except Exception as e:
-            print(f"[NEXAR] ❌ OAuth token error: {e}")
+            print(f"[NEXAR] ❌ OAuth error: {e}")
             return None
 
-    # ───────────────── GraphQL query ─────────────────
+    # ── GraphQL query ────────────────────────────────────────────────────────
     query = """
     query Search($q: String!) {
-      supSearchMpn(q: $q, limit: 1) {
+      supSearchMpn(q: $q, limit: 3) {
         results {
           part {
             mpn
@@ -453,7 +496,6 @@ def search_nexar(part_number, client_id, client_secret, _token_cache):
                 inventoryLevel
                 moq
                 factoryLeadDays
-                packaging
                 prices { quantity price currency }
               }
             }
@@ -474,117 +516,154 @@ def search_nexar(part_number, client_id, client_secret, _token_cache):
         print(f"[NEXAR] GraphQL HTTP status: {r.status_code}")
         r.raise_for_status()
 
-        response_json = r.json()
-        hits = (
-            response_json
-            .get("data", {})
-            .get("supSearchMpn", {})
-            .get("results", [])
-        )
+        rj = r.json()
 
-        print(f"[NEXAR] Hits returned: {len(hits)}")
-
-        # Surface any GraphQL errors for easier debugging
-        if response_json.get("errors"):
-            print(f"[NEXAR] ❌ GraphQL errors: {response_json['errors']}")
+        if rj.get("errors"):
+            print(f"[NEXAR] ❌ GraphQL errors: {rj['errors']}")
             return None
 
-        if not hits:
-            print("[NEXAR] ❌ No hits found for part")
+        results_list = (
+            (rj.get("data") or {})
+            .get("supSearchMpn") or {}
+        ).get("results") or []
+
+        print(f"[NEXAR] Results returned: {len(results_list)}")
+
+        if not results_list:
+            print("[NEXAR] ❌ No results found")
             return None
 
-        part_data = hits[0].get("part") if hits[0] else None
+        # Find exact MPN match first, fall back to first result
+        part_data = None
+        pn_upper  = part_number.upper()
+        for res in results_list:
+            if not res:
+                continue
+            pd_cand = res.get("part")
+            if pd_cand and (pd_cand.get("mpn") or "").upper() == pn_upper:
+                part_data = pd_cand
+                break
+        if part_data is None:
+            for res in results_list:
+                if res and res.get("part"):
+                    part_data = res["part"]
+                    break
+
         if not part_data:
-            print("[NEXAR] ❌ First hit has no part data")
+            print("[NEXAR] ❌ No valid part data in any result")
             return None
-        sellers = part_data.get("sellers", [])
+
+        print(f"[NEXAR] Using part: {part_data.get('mpn')}")
+
+        sellers = part_data.get("sellers") or []
         print(f"[NEXAR] Sellers found: {len(sellers)}")
 
-        best_offer = None
-        best_price = float("inf")
+        best_offer  = None
+        best_price  = float("inf")
         best_seller = ""
+        best_stock  = 0
 
-        # ───────────────── Offer evaluation ─────────────────
         for seller in sellers:
-            seller_name = seller.get("company", {}).get("name", "UNKNOWN")
-            offers = seller.get("offers", [])
-            print(f"[NEXAR]  Seller '{seller_name}' offers: {len(offers)}")
+            # ── Guard: skip None seller entries ──────────────────────────
+            if not seller:
+                continue
+            seller_name = ((seller.get("company") or {}).get("name") or "Unknown")
+            offers      = seller.get("offers") or []
 
             for offer in offers:
-                print(
-                    f"[NEXAR]   Offer SKU={offer.get('sku')} "
-                    f"Stock={offer.get('inventoryLevel')} "
-                    f"Prices={len(offer.get('prices', []))}"
-                )
+                # ── Guard: skip None offer entries ────────────────────────
+                if not offer:
+                    continue
 
-                prices = offer.get("prices", [])
+                prices      = offer.get("prices") or []
+                inv_level   = offer.get("inventoryLevel") or 0
+                stock       = int(safe_float(inv_level, default=0))
 
                 if prices:
-                    valid_prices = [
-                        safe_float(p.get("price"))
-                        for p in prices
-                        if pd.notna(safe_float(p.get("price")))
-                    ]
-                    print(f"[NEXAR]    Valid prices: {valid_prices}")
+                    valid_prices = []
+                    for p in prices:
+                        if not p:
+                            continue
+                        # Accept USD or unspecified currency
+                        curr = (p.get("currency") or "").upper()
+                        if curr not in ("USD", ""):
+                            continue
+                        v = safe_float(p.get("price"))
+                        if pd.notna(v) and v > 0:
+                            valid_prices.append(v)
+
+                    print(f"[NEXAR]   Seller={seller_name} SKU={offer.get('sku')} "
+                          f"Stock={stock} Prices={valid_prices}")
 
                     if valid_prices:
                         min_p = min(valid_prices)
-                        if min_p < best_price:
-                            best_price = min_p
-                            best_offer = offer
+                        # Prefer lower price; break ties by higher stock
+                        if min_p < best_price or (
+                            min_p == best_price and stock > best_stock
+                        ):
+                            best_price  = min_p
+                            best_offer  = offer
                             best_seller = seller_name
-                            print(f"[NEXAR] ✅ New best price: {min_p}")
+                            best_stock  = stock
+                            print(f"[NEXAR] ✅ New best: price={min_p}, stock={stock}")
+
                 else:
-                    if offer.get("inventoryLevel", 0) > 0 and best_offer is None:
-                        best_offer = offer
+                    # No pricing — still useful as a stock-only fallback
+                    if stock > 0 and best_offer is None:
+                        best_offer  = offer
                         best_seller = seller_name
-                        print("[NEXAR] ⚠️ Stock-only offer selected (quote required)")
+                        best_stock  = stock
+                        print(f"[NEXAR] ⚠️ Stock-only offer (no pricing): {seller_name}")
 
         if not best_offer:
-            print("[NEXAR] ❌ No valid offers selected")
+            print("[NEXAR] ❌ No valid offer found across all sellers")
             return None
 
-        # ───────────────── Pricing normalization ─────────────────
-        pricing = sorted(
-            [
-                {"qty": int(p["quantity"]), "price": safe_float(p["price"])}
-                for p in best_offer.get("prices", [])
-                if p.get("currency") == "USD"
-                and pd.notna(safe_float(p.get("price")))
-            ],
-            key=lambda x: x["qty"],
-        )
+        # ── Build normalised price breaks ────────────────────────────────
+        pricing = []
+        for p in (best_offer.get("prices") or []):
+            if not p:
+                continue
+            curr = (p.get("currency") or "").upper()
+            if curr not in ("USD", ""):
+                continue
+            try:
+                q = int(safe_float(p.get("quantity", 1), default=1))
+                v = safe_float(p.get("price"))
+                if q > 0 and pd.notna(v) and v > 0:
+                    pricing.append({"qty": q, "price": v})
+            except:
+                pass
+        pricing = sorted(pricing, key=lambda x: x["qty"])
 
-        print(f"[NEXAR] Final pricing tiers (USD): {pricing}")
+        print(f"[NEXAR] Final pricing tiers: {pricing}")
 
-        lt_raw = best_offer.get("factoryLeadDays")
+        lt_raw  = best_offer.get("factoryLeadDays")
         lt_days = int(safe_float(lt_raw)) if pd.notna(safe_float(lt_raw)) else np.nan
 
-        print(
-            f"[NEXAR] ✅ Returning result: "
-            f"Seller={best_seller}, Stock={best_offer.get('inventoryLevel')}, "
-            f"LeadTime={lt_days}"
-        )
+        print(f"[NEXAR] ✅ Returning: seller={best_seller}, "
+              f"stock={best_offer.get('inventoryLevel')}, lt={lt_days}")
 
         return {
-            "Source": best_seller or "Octopart (Nexar)",
-            "SourcePartNumber": best_offer.get("sku", "N/A"),
-            "ManufacturerPartNumber": part_data.get("mpn", part_number),
-            "Manufacturer": (part_data.get("manufacturer") or {}).get("name", "N/A"),
-            "Description": part_data.get("shortDescription", ""),
-            "Stock": int(safe_float(best_offer.get("inventoryLevel", 0), default=0)),
-            "LeadTimeDays": lt_days,
-            "MinOrderQty": int(safe_float(best_offer.get("moq", 1), default=1)),
-            "Pricing": pricing,
-            "CountryOfOrigin": "Unknown",
-            "NormallyStocking": True,
-            "Discontinued": False,
-            "EndOfLife": False,
-            "DatasheetUrl": (part_data.get("bestDatasheet") or {}).get("url", ""),
+            "Source":                 best_seller or "Nexar",
+            "SourcePartNumber":       (best_offer.get("sku") or "N/A"),
+            "ManufacturerPartNumber": (part_data.get("mpn") or part_number),
+            "Manufacturer":           ((part_data.get("manufacturer") or {}).get("name") or "N/A"),
+            "Description":            (part_data.get("shortDescription") or ""),
+            "Stock":                  int(safe_float(best_offer.get("inventoryLevel", 0), default=0)),
+            "LeadTimeDays":           lt_days,
+            "MinOrderQty":            max(1, int(safe_float(best_offer.get("moq", 1), default=1))),
+            "Pricing":                pricing,
+            "CountryOfOrigin":        "Unknown",
+            "NormallyStocking":       True,
+            "Discontinued":           False,
+            "EndOfLife":              False,
+            "DatasheetUrl":           ((part_data.get("bestDatasheet") or {}).get("url") or ""),
         }
 
     except Exception as e:
         print(f"[NEXAR] ❌ GraphQL processing error: {e}")
+        import traceback; traceback.print_exc()
         return None
 
 def get_part_data_parallel(part_number, mouser_key, nexar_id, nexar_secret, nexar_token_cache):
@@ -1461,7 +1540,7 @@ else:
 - ⚠️ Multi-factor **risk scoring** (Sourcing, Stock, Lead Time, Lifecycle, Geographic) — same weights as desktop app
 - 🌍 **Tariff/duty estimation** by country of origin
 - 📊 **4 purchasing strategies**: Lowest Cost (Strict), Lowest Cost (In Stock), Fastest, Optimized
-- 🤖 **AI executive summary** via Groq (free, no credit card)
+- 🤖 **AI executive summary** via OpenAI
 - 📤 Full **CSV export** for every result and strategy
         """)
     with col_b:
