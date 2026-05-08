@@ -1,11 +1,19 @@
 """
-BOM Analyzer Web Edition v1.0.0
-Faithful Streamlit conversion of Tyler Allen's BOM_Analyzer desktop app.
-Component Revision Delta (or Difference) Verification - CRDV
-- Original risk scoring, strategy engine, and buy-up logic preserved exactly
-- OpenAI replaced with Groq (free tier)
-- Tkinter GUI replaced with Streamlit
-- DigiKey OAuth replaced with Mouser + Nexar (no localhost callback needed)
+BOM Analyzer Web Edition v1.2.0
+Fixes:
+  [PRICING BUG]  apiCurrency is now a user-selectable sidebar option (default INR for
+                  mouser.in accounts). mouser.in keys are issued in INR — sending USD
+                  caused the API to return PriceBreaks:[] for all parts.
+  [PRICING BUG]  parse_price_robust() now strips ₹, €, £ and INR/JPY/EUR/GBP code
+                  prefixes in addition to USD/$, covering mouser.in price strings.
+  [PRICING BUG]  Robust price string parser handles "1.87000", "₹156.00", "1,87"
+                  (EU locale), null, "0.00000" — all cases were silently discarded.
+  [PRICING BUG]  Diagnostic logging on every price-break parse attempt.
+  [FEATURE]      Currency symbol (₹ / $ / € etc.) propagates through all KPI metrics,
+                  cost columns, chart labels, and the AI prompt.
+  [FEATURE]      Alternative / substitute parts from Mouser AlternatePackaging +
+                  SuggestedReplacement, surfaced in BOM Analysis tab.
+  [FEATURE]      Per-part detail expander shows pricing tiers + alternatives inline.
 """
 
 import streamlit as st
@@ -38,10 +46,35 @@ st.markdown("""
   .risk-mod    { background:#fef3c7; border-left:4px solid #ca5010; padding:5px 10px; border-radius:4px; }
   .risk-low    { background:#dcfce7; border-left:4px solid #107c10; padding:5px 10px; border-radius:4px; }
   .kpi-box { background:#f0f4fa; border-radius:8px; padding:1rem; border-left:4px solid #0078d4; }
+  .alt-chip { display:inline-block; background:#e8f0fe; color:#1a56db; border-radius:12px;
+              padding:2px 8px; font-size:.78rem; margin:2px; font-family:monospace; }
+  /* KPI cards — two-row layout */
+  .kpi-card {
+    background: #ffffff;
+    border: 1px solid #e5e9f0;
+    border-radius: 10px;
+    padding: 14px 18px 12px 18px;
+    text-align: center;
+    height: 100%;
+  }
+  .kpi-card.cost   { border-top: 4px solid #0078d4; }
+  .kpi-card.tariff { border-top: 4px solid #ca5010; }
+  .kpi-card.impact { border-top: 4px solid #6c757d; }
+  .kpi-card.high   { border-top: 4px solid #d13438; }
+  .kpi-card.mod    { border-top: 4px solid #ca5010; }
+  .kpi-card.low    { border-top: 4px solid #107c10; }
+  .kpi-card.eol    { border-top: 4px solid #8764b8; }
+  .kpi-label { font-size: .78rem; color: #666; font-weight: 600;
+               text-transform: uppercase; letter-spacing: .04em; margin-bottom: 6px; }
+  .kpi-value { font-size: 1.55rem; font-weight: 700; color: #111; line-height: 1.1; }
+  .kpi-sub   { font-size: .78rem; color: #888; margin-top: 4px; }
+  .kpi-delta-pos { color: #ca5010; font-size: .82rem; font-weight: 600; margin-top: 4px; }
+  .kpi-delta-neu { color: #555;    font-size: .82rem; margin-top: 4px; }
+  .kpi-pending   { color: #aaa; font-size: 1.1rem; font-style: italic; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Constants (exact from source) ─────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 RISK_WEIGHTS     = {'Sourcing': 0.30, 'Stock': 0.15, 'LeadTime': 0.15, 'Lifecycle': 0.30, 'Geographic': 0.10}
 GEO_RISK_TIERS   = {
     "China":7,"Russia":9,"Taiwan":5,"Malaysia":4,"Vietnam":4,"India":5,"Philippines":4,
@@ -53,7 +86,6 @@ RISK_CATEGORIES  = {'high':(6.6,10.0), 'moderate':(3.6,6.5), 'low':(0.0,3.5)}
 API_TIMEOUT      = 20
 MAX_WORKERS      = 6
 
-# Country name → ISO2 helpers for COO matching
 COUNTRY_ISO = {
     "CN":"China","TW":"Taiwan","US":"United States","MX":"Mexico","DE":"Germany",
     "JP":"Japan","KR":"South Korea","MY":"Malaysia","VN":"Vietnam","IN":"India",
@@ -61,21 +93,49 @@ COUNTRY_ISO = {
     "IE":"Ireland","CH":"Switzerland","RU":"Russia",
 }
 
-# ── Utility Functions (ported from source) ─────────────────────────────────────
+# ── Utility Functions ─────────────────────────────────────────────────────────
 
 def safe_float(value, default=np.nan):
     if value is None or isinstance(value, bool): return default
-    if isinstance(value, (int,float)):
+    if isinstance(value, (int, float)):
         return float(value) if not np.isinf(value) else default
     try:
         s = str(value).strip().replace('$','').replace(',','').replace('%','').lower()
+        # Strip currency prefix e.g. "USD 1.23" or "usd1.23"
+        s = re.sub(r'^[a-z]{3}\s*', '', s)
         if not s or s in ['n/a','none','inf','-inf','na','nan','']: return default
         return float(s)
     except: return default
 
 
+def format_cost(value, symbol, currency):
+    """
+    Format a cost value with appropriate abbreviation to avoid truncation.
+    INR  : uses Indian lakh/crore notation  (₹1.23L, ₹4.56Cr)
+    Others: uses K/M notation               ($1.23K, $4.56M)
+    Always shows 2-3 significant figures so the number stays readable in a narrow metric card.
+    """
+    if not isinstance(value, (int, float)) or np.isnan(value):
+        return "—"
+    if currency == "INR":
+        if value >= 1_00_00_000:          # ≥ 1 Crore
+            return f"{symbol}{value/1_00_00_000:.2f} Cr"
+        elif value >= 1_00_000:           # ≥ 1 Lakh
+            return f"{symbol}{value/1_00_000:.2f} L"
+        elif value >= 1_000:
+            return f"{symbol}{value:,.0f}"
+        else:
+            return f"{symbol}{value:.2f}"
+    else:
+        if value >= 1_000_000:
+            return f"{symbol}{value/1_000_000:.2f}M"
+        elif value >= 1_000:
+            return f"{symbol}{value/1_000:.2f}K"
+        else:
+            return f"{symbol}{value:.2f}"
+
+
 def convert_lead_time_to_days(val):
-    """Exact port of source convert_lead_time_to_days."""
     if val is None or (isinstance(val, float) and np.isnan(val)): return np.nan
     if isinstance(val, (int, float)):
         return int(round(val)) if not np.isinf(val) else np.nan
@@ -91,17 +151,45 @@ def convert_lead_time_to_days(val):
     except: return np.nan
 
 
+def parse_price_robust(raw):
+    """
+    Parse a price value returned by Mouser / Nexar APIs.
+    Handles all regional formats:
+      mouser.com  : "1.87000", "$1.87", "USD 1.87"
+      mouser.in   : "₹156.00", "INR 156.00", "156.00000"
+      EU portals  : "1,87", "EUR 1,87", "€1,87"
+      Edge cases  : None, "", "0.00000", 0
+    Returns float or np.nan.
+    """
+    if raw is None: return np.nan
+    if isinstance(raw, (int, float)):
+        v = float(raw)
+        return v if (not np.isinf(v) and v > 0) else np.nan
+    s = str(raw).strip()
+    # Strip 3-letter currency code prefix (USD, INR, EUR, GBP, CAD, JPY, AUD …)
+    s = re.sub(r'(?i)^[a-z]{3}[\s]*', '', s)
+    # Strip currency symbols: $ ₹ € £ ¥
+    s = s.replace('$','').replace('₹','').replace('€','').replace('£','').replace('¥','').replace(' ','')
+    # Handle European decimal comma: "1,87" → "1.87"  (only when no dot present)
+    if ',' in s and '.' not in s:
+        s = s.replace(',', '.')
+    else:
+        # Remove thousands comma: "1,234.56" → "1234.56"
+        s = s.replace(',', '')
+    if not s or s in ['n/a','none','nan','']: return np.nan
+    try:
+        v = float(s)
+        return v if v > 0 else np.nan
+    except:
+        return np.nan
+
+
 def get_optimal_cost(qty_needed, pricing_breaks, min_order_qty=0, buy_up_threshold_pct=1.0):
-    """
-    Exact port of BOMAnalyzerApp.get_optimal_cost.
-    Returns (unit_price, total_cost, actual_order_qty, notes)
-    """
     notes = ""
     if not isinstance(qty_needed, (int,float)) or qty_needed <= 0:
         return np.nan, np.nan, qty_needed, "Invalid Qty Needed"
     if not isinstance(pricing_breaks, list):
         return np.nan, np.nan, qty_needed, "Invalid Pricing Data"
-
     try:
         valid_breaks = [
             {'qty': int(pb['qty']), 'price': safe_float(pb['price'])}
@@ -118,7 +206,6 @@ def get_optimal_cost(qty_needed, pricing_breaks, min_order_qty=0, buy_up_thresho
         return np.nan, np.nan, qty_needed, f"Pricing Data Error: {e}"
 
     base_order_qty = max(int(qty_needed), min_order_qty)
-
     base_unit_price = np.nan
     applicable_break = None
     for pb in pricing_breaks:
@@ -162,40 +249,29 @@ def get_optimal_cost(qty_needed, pricing_breaks, min_order_qty=0, buy_up_thresho
 
 def calculate_risk_score(sourcing_count, stock_available, qty_needed,
                          lead_time_days, lifecycle_notes, coo):
-    """
-    Exact port of source risk factor logic from analyze_single_part.
-    Returns (overall_score 0-10, risk_factors dict)
-    """
     risk_factors = {}
-
-    # Sourcing risk  (0, 4, 7, 10)
     if sourcing_count == 0:   risk_factors['Sourcing'] = 10
     elif sourcing_count == 1: risk_factors['Sourcing'] = 7
     elif sourcing_count == 2: risk_factors['Sourcing'] = 4
     else:                     risk_factors['Sourcing'] = 0
 
-    # Stock risk
     has_stock_gap = (stock_available < qty_needed)
-    if has_stock_gap:                                    risk_factors['Stock'] = 8
-    elif stock_available < 1.5 * qty_needed:             risk_factors['Stock'] = 4
-    else:                                                risk_factors['Stock'] = 0
+    if has_stock_gap:                                risk_factors['Stock'] = 8
+    elif stock_available < 1.5 * qty_needed:         risk_factors['Stock'] = 4
+    else:                                            risk_factors['Stock'] = 0
 
-    # Lead time risk (based on fastest available)
     lt = lead_time_days
-    if pd.isna(lt) or lt == np.inf:       risk_factors['LeadTime'] = 9
-    elif lt == 0:                          risk_factors['LeadTime'] = 0
-    elif lt > 90:                          risk_factors['LeadTime'] = 7
-    elif lt > 45:                          risk_factors['LeadTime'] = 4
-    else:                                  risk_factors['LeadTime'] = 1
+    if pd.isna(lt) or lt == np.inf:   risk_factors['LeadTime'] = 9
+    elif lt == 0:                      risk_factors['LeadTime'] = 0
+    elif lt > 90:                      risk_factors['LeadTime'] = 7
+    elif lt > 45:                      risk_factors['LeadTime'] = 4
+    else:                              risk_factors['LeadTime'] = 1
 
-    # Lifecycle risk
     lc = str(lifecycle_notes).upper()
-    if "EOL" in lc or "DISC" in lc:       risk_factors['Lifecycle'] = 10
-    else:                                  risk_factors['Lifecycle'] = 0
+    if "EOL" in lc or "DISC" in lc:   risk_factors['Lifecycle'] = 10
+    else:                              risk_factors['Lifecycle'] = 0
 
-    # Geographic risk
-    # Try to match country name from COO string
-    coo_str = str(coo).strip()
+    coo_str   = str(coo).strip()
     geo_score = GEO_RISK_TIERS.get("_DEFAULT_", 4)
     for country, score in GEO_RISK_TIERS.items():
         if country.lower() in coo_str.lower():
@@ -209,42 +285,26 @@ def calculate_risk_score(sourcing_count, stock_available, qty_needed,
 
 
 def get_tariff_rate(coo, custom_tariffs):
-    """Map COO to tariff rate using custom tariff table or defaults."""
     coo_str = str(coo).strip().lower()
     for country, rate in custom_tariffs.items():
         if country.lower() in coo_str:
             return rate
-    # Default tariff
     if "china" in coo_str or "cn" == coo_str: return 0.25
     if "taiwan" in coo_str or "tw" == coo_str: return 0.0
-    return 0.035  # WTO baseline
+    return 0.035
 
 
 # ── Part Number Cleaner ───────────────────────────────────────────────────────
 
 def clean_part_number(pn):
-    """
-    Clean and normalize part numbers before sending to supplier APIs.
-    Handles all patterns found in real-world PCB BOM exports:
-    - Leading apostrophes from Excel  ('9001-12-01 → 9001-12-01)
-    - PBFREE / PB FREE suffix         (2N3906 PBFREE → 2N3906)
-    - Trailing/leading whitespace     (C3216X7R2E104K160AA  → C3216X7R2E104K160AA)
-    - Embedded newlines from CSV      (cleaned at CSV-read stage)
-    - ADI #PBF suffix                 (LTC2057HVHS8#PBF → KEEP as-is, Mouser recognizes it)
-    Returns (cleaned_pn, original_pn, list_of_changes)
-    """
     original = pn
     changes  = []
     p        = str(pn).strip()
 
-    # Remove leading apostrophe/quote (Excel CSV artifact — Excel prepends ' to
-    # prevent numeric interpretation of part numbers like 9001-12-01)
     if p.startswith(("'", '"', "`")):
         p = p.lstrip("'\"`")
         changes.append("removed leading apostrophe (Excel artifact)")
 
-    # Remove PBFREE / PB-FREE / PB FREE suffix (RoHS marker, not part of MPN)
-    # Important: Do NOT strip #PBF from ADI/LTC parts — it IS part of their MPN
     pbfree_variants = [" PBFREE", "-PBFREE", "_PBFREE", " PB-FREE", "-PB-FREE", " PB FREE"]
     p_upper = p.upper()
     for suffix in pbfree_variants:
@@ -253,10 +313,7 @@ def clean_part_number(pn):
             changes.append(f"removed '{suffix.strip()}' suffix")
             break
 
-    # Remove common distributor/packaging suffixes that aren't part of the base MPN
-    # Exception: #PBF is kept because ADI/LTC use it as part of their official MPN
-    dist_suffixes = ["-ND", "-1-ND", "-2-ND", "-TR", "-T&R", "-TRC",
-                     "-CT", "-CUT", "-REEL", "/T", "-T"]
+    dist_suffixes = ["-ND", "-1-ND", "-2-ND", "-TR", "-T&R", "-TRC", "-CT", "-CUT", "-REEL", "/T", "-T"]
     p_upper = p.upper()
     for suffix in dist_suffixes:
         if p_upper.endswith(suffix.upper()):
@@ -264,7 +321,6 @@ def clean_part_number(pn):
             changes.append(f"removed distributor suffix '{suffix}'")
             break
 
-    # Final whitespace cleanup
     p_clean = p.strip()
     if p_clean != original.strip() and not changes:
         changes.append("stripped whitespace")
@@ -274,39 +330,44 @@ def clean_part_number(pn):
 
 # ── API Functions ─────────────────────────────────────────────────────────────
 
-def search_mouser(part_number, api_key):
-    """Fetch from Mouser API. Returns standardized result dict or None."""
-
-    print(f"[MOUSER] search_mouser called for PN: {part_number}")
+def search_mouser(part_number, api_key, currency="INR"):
+    """
+    Fetch from Mouser API.
+    FIX 1: apiCurrency is now a parameter (default INR for mouser.in accounts).
+            mouser.com accounts should pass "USD". Without the correct currency
+            Mouser returns PriceBreaks:[] for all parts.
+    FIX 2: parse_price_robust() handles ₹, INR prefix, EU comma decimals.
+    FIX 3: Raw PriceBreaks logged so failures are visible.
+    NEW:   AlternatePackaging + SuggestedReplacement extracted as alternatives list.
+    """
+    print(f"[MOUSER] search_mouser called for PN: {part_number} | currency={currency}")
 
     if not api_key:
         print("[MOUSER] ❌ No API key provided")
         return None
 
     url = "https://api.mouser.com/api/v1/search/partnumber"
-    params = {"apiKey": api_key}
+    # ▶ KEY FIX: apiCurrency must match your Mouser account's registered currency.
+    #   mouser.in  → INR   |   mouser.com → USD   |   mouser.de → EUR  etc.
+    params = {
+        "apiKey":      api_key,
+        "apiCurrency": currency,
+    }
     payload = {
         "SearchByPartRequest": {
-            "mouserPartNumber": part_number,
-            "partSearchOptions": "Exact"
+            "mouserPartNumber":   part_number,
+            "partSearchOptions":  "Exact"
         }
     }
 
     try:
-        print("[MOUSER] 📡 Sending API request")
-        r = requests.post(
-            url,
-            params=params,
-            json=payload,
-            timeout=API_TIMEOUT
-        )
-
+        print(f"[MOUSER] 📡 Sending API request (apiCurrency={currency})")
+        r = requests.post(url, params=params, json=payload, timeout=API_TIMEOUT)
         print(f"[MOUSER] HTTP status: {r.status_code}")
         r.raise_for_status()
 
-        data = r.json()
+        data  = r.json()
         parts = data.get("SearchResults", {}).get("Parts", [])
-
         print(f"[MOUSER] Parts returned: {len(parts)}")
 
         if not parts:
@@ -320,100 +381,106 @@ def search_mouser(part_number, api_key):
             f"MouserPN={p.get('MouserPartNumber')}"
         )
 
-        # ───────────── Price breaks ─────────────
+        # ── FIX 2 + FIX 3: Price breaks with full diagnostic logging ──────
+        raw_breaks = p.get("PriceBreaks", [])
+        print(f"[MOUSER] Raw PriceBreaks ({len(raw_breaks)} entries): {raw_breaks}")
+
         price_breaks = []
-        for pb in p.get("PriceBreaks", []):
+        for idx, pb in enumerate(raw_breaks):
             try:
-                qty = int(pb.get("Quantity", 0))
-                raw_price = str(pb.get("Price", "") or "").strip().replace("$", "").replace(",", "").replace(" ", "")
-                price = safe_float(raw_price if raw_price else "0")
-                if qty > 0 and pd.notna(price) and price > 0:
+                qty       = int(str(pb.get("Quantity", 0) or 0).replace(",",""))
+                raw_price = pb.get("Price")
+                price     = parse_price_robust(raw_price)
+                print(f"[MOUSER]   Break[{idx}]: Qty={qty} RawPrice={repr(raw_price)} → parsed={price}")
+                if qty > 0 and pd.notna(price):
                     price_breaks.append({"qty": qty, "price": price})
+                else:
+                    print(f"[MOUSER]   Break[{idx}] SKIPPED (qty={qty} price={price})")
             except Exception as e:
-                print(f"[MOUSER] ⚠️ PriceBreak parse error: {e}")
+                print(f"[MOUSER] ⚠️ PriceBreak[{idx}] parse error: {e}")
 
-        # Fallback: if no price breaks, try top-level UnitPrice field
-        # Fallback 1: top-level UnitPrice field
+        # Fallback 1: top-level UnitPrice
         if not price_breaks:
-            unit_price_raw = str(p.get("UnitPrice", "") or "").strip().replace("$", "").replace(",", "").replace(" ", "")
-            unit_price = safe_float(unit_price_raw)
-            moq = int(safe_float(p.get("Min", "1"), default=1))
-            if pd.notna(unit_price) and unit_price > 0:
+            raw_up    = p.get("UnitPrice")
+            unit_price = parse_price_robust(raw_up)
+            moq        = max(1, int(safe_float(p.get("Min", "1"), default=1)))
+            print(f"[MOUSER] UnitPrice fallback: raw={repr(raw_up)} → parsed={unit_price}")
+            if pd.notna(unit_price):
                 price_breaks.append({"qty": moq, "price": unit_price})
-                print(f"[MOUSER] UnitPrice fallback: {moq}x${unit_price}")
+                print(f"[MOUSER] ✅ Using UnitPrice fallback: {moq}x${unit_price}")
 
-        # Fallback 2: keyword search endpoint — returns pricing when partnumber endpoint doesn't
+        # Fallback 2: keyword search
         if not price_breaks:
+            print("[MOUSER] ⚠️ No price from partnumber endpoint — trying keyword search")
             try:
                 kw_url = "https://api.mouser.com/api/v1/search/keyword"
                 kw_payload = {
                     "SearchByKeywordRequest": {
-                        "keyword": part_number,
-                        "records": 5,
-                        "startingRecord": 0,
-                        "searchOptions": "",
+                        "keyword": part_number, "records": 5,
+                        "startingRecord": 0, "searchOptions": "",
                         "searchWithYourSignUpLanguage": ""
                     }
                 }
-                kw_r = requests.post(kw_url, params={"apiKey": api_key}, json=kw_payload, timeout=API_TIMEOUT)
+                kw_r     = requests.post(kw_url, params=params, json=kw_payload, timeout=API_TIMEOUT)
                 kw_r.raise_for_status()
                 kw_parts = kw_r.json().get("SearchResults", {}).get("Parts", [])
-                # Find best matching part from keyword results
                 kw_match = None
                 for kp in kw_parts:
                     if kp.get("ManufacturerPartNumber", "").upper() == part_number.upper():
-                        kw_match = kp
-                        break
+                        kw_match = kp; break
                 if kw_match is None and kw_parts:
                     kw_match = kw_parts[0]
                 if kw_match:
-                    for pb in (kw_match.get("PriceBreaks") or []):
-                        try:
-                            qty = int(pb.get("Quantity", 0) or 0)
-                            raw_p = str(pb.get("Price", "") or "").strip().replace("$","").replace(",","").replace(" ","")
-                            price = safe_float(raw_p)
-                            if qty > 0 and pd.notna(price) and price > 0:
-                                price_breaks.append({"qty": qty, "price": price})
-                        except:
-                            pass
-                    if price_breaks:
-                        print(f"[MOUSER] Keyword fallback got {len(price_breaks)} price breaks")
-                    else:
-                        # Last resort: UnitPrice from keyword result
-                        kw_up = safe_float(str(kw_match.get("UnitPrice","") or "").replace("$","").replace(",","").strip())
+                    kw_raw_breaks = kw_match.get("PriceBreaks", [])
+                    print(f"[MOUSER] Keyword fallback raw PriceBreaks: {kw_raw_breaks}")
+                    for pb in kw_raw_breaks:
+                        qty   = int(str(pb.get("Quantity", 0) or 0).replace(",",""))
+                        price = parse_price_robust(pb.get("Price"))
+                        if qty > 0 and pd.notna(price):
+                            price_breaks.append({"qty": qty, "price": price})
+                    if not price_breaks:
+                        kw_up  = parse_price_robust(kw_match.get("UnitPrice"))
                         kw_moq = max(1, int(safe_float(kw_match.get("Min","1"), default=1)))
-                        if pd.notna(kw_up) and kw_up > 0:
+                        if pd.notna(kw_up):
                             price_breaks.append({"qty": kw_moq, "price": kw_up})
                             print(f"[MOUSER] Keyword UnitPrice fallback: {kw_moq}x${kw_up}")
             except Exception as e:
                 print(f"[MOUSER] Keyword fallback error: {e}")
 
-        # ───────────── Lead time ─────────────
-        raw_lt = p.get("LeadTime", "")
+        if not price_breaks:
+            print("[MOUSER] ❌ ALL pricing paths exhausted — no price data available for this PN")
+        else:
+            print(f"[MOUSER] ✅ Final price_breaks: {price_breaks}")
+
+        # ── Lead time ──────────────────────────────────────────────────────
+        raw_lt  = p.get("LeadTime", "")
         lt_days = convert_lead_time_to_days(raw_lt)
         print(f"[MOUSER] Lead time raw='{raw_lt}' → {lt_days} days")
 
-        # ───────────── Lifecycle ─────────────
-        eol = (p.get("LifecycleStatus") or "").upper()
-        is_eol = any(
-            x in eol
-            for x in ["OBSOLETE", "EOL", "DISCONTINUED", "NOT RECOMMENDED"]
-        )
+        # ── Lifecycle ──────────────────────────────────────────────────────
+        eol    = (p.get("LifecycleStatus") or "").upper()
+        is_eol = any(x in eol for x in ["OBSOLETE", "EOL", "DISCONTINUED", "NOT RECOMMENDED"])
         is_disc = "DISCONTINUED" in eol
+        print(f"[MOUSER] LifecycleStatus='{eol}', EOL={is_eol}, Discontinued={is_disc}")
 
-        print(
-            f"[MOUSER] LifecycleStatus='{eol}', "
-            f"EOL={is_eol}, Discontinued={is_disc}"
-        )
-
-        # ───────────── Stock ─────────────
-        stock = int(safe_float(
-            p.get("AvailabilityInStock", 0),
-            default=0
-        ))
-
+        # ── Stock ──────────────────────────────────────────────────────────
+        stock = int(safe_float(p.get("AvailabilityInStock", 0), default=0))
         print(f"[MOUSER] Stock available: {stock}")
 
+        # ── NEW: Alternative parts ─────────────────────────────────────────
+        # AlternatePackaging: same component, different package (tape/reel, bulk, cut-tape)
+        alternatives = []
+        for alt in (p.get("AlternatePackaging") or []):
+            alt_mpn = (alt.get("MouserPartNumber") or alt.get("ManufacturerPartNumber") or "").strip()
+            if alt_mpn and alt_mpn != p.get("MouserPartNumber",""):
+                alternatives.append(alt_mpn)
+
+        # SuggestedReplacement: Mouser's preferred substitute for EOL/NRND parts
+        suggested = (p.get("SuggestedReplacement") or "").strip()
+        if suggested:
+            alternatives.append(f"⚑ {suggested} (suggested replacement)")
+
+        print(f"[MOUSER] Alternatives found: {alternatives}")
         print("[MOUSER] ✅ Returning Mouser result")
 
         return {
@@ -431,22 +498,22 @@ def search_mouser(part_number, api_key):
             "Discontinued":           is_disc,
             "EndOfLife":              is_eol,
             "DatasheetUrl":           p.get("DataSheetUrl", ""),
+            "Alternatives":           alternatives,          # ← NEW
+            "ROHSStatus":             p.get("ROHSStatus", ""),  # ← NEW bonus field
         }
 
     except Exception as e:
         print(f"[MOUSER] ❌ API error: {e}")
         return None
 
+
 def search_nexar(part_number, client_id, client_secret, _token_cache):
     """Fetch from Nexar (Octopart) GraphQL API. Returns standardized result dict or None."""
-
     print(f"[NEXAR] search_nexar called for PN: {part_number}")
-
     if not client_id or not client_secret:
         print("[NEXAR] ❌ Missing client_id or client_secret")
         return None
 
-    # ── Token handling ──────────────────────────────────────────────────────
     now = time.time()
     if _token_cache.get("expires_at", 0) > now + 60:
         token = _token_cache["access_token"]
@@ -457,29 +524,22 @@ def search_nexar(part_number, client_id, client_secret, _token_cache):
             tr = requests.post(
                 "https://identity.nexar.com/connect/token",
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
-                data={
-                    "grant_type":    "client_credentials",
-                    "client_id":     client_id,
-                    "client_secret": client_secret,
-                    "scope":         "supply.domain",
-                },
+                data={"grant_type":"client_credentials","client_id":client_id,
+                      "client_secret":client_secret,"scope":"supply.domain"},
                 timeout=API_TIMEOUT,
             )
             print(f"[NEXAR] OAuth HTTP status: {tr.status_code}")
             tr.raise_for_status()
-            td = tr.json()
+            td    = tr.json()
             token = td.get("access_token")
             if not token:
-                print(f"[NEXAR] ❌ No access_token in response: {td}")
-                return None
+                print(f"[NEXAR] ❌ No access_token: {td}"); return None
             _token_cache["access_token"] = token
             _token_cache["expires_at"]   = now + td.get("expires_in", 3600) - 60
             print("[NEXAR] ✅ OAuth token acquired and cached")
         except Exception as e:
-            print(f"[NEXAR] ❌ OAuth error: {e}")
-            return None
+            print(f"[NEXAR] ❌ OAuth error: {e}"); return None
 
-    # ── GraphQL query ────────────────────────────────────────────────────────
     query = """
     query Search($q: String!) {
       supSearchMpn(q: $q, limit: 3) {
@@ -492,10 +552,7 @@ def search_nexar(part_number, client_id, client_secret, _token_cache):
             sellers(includeBrokers: false) {
               company { name }
               offers {
-                sku
-                inventoryLevel
-                moq
-                factoryLeadDays
+                sku inventoryLevel moq factoryLeadDays
                 prices { quantity price currency }
               }
             }
@@ -504,7 +561,6 @@ def search_nexar(part_number, client_id, client_secret, _token_cache):
       }
     }
     """
-
     try:
         print("[NEXAR] 📡 Sending GraphQL request")
         r = requests.post(
@@ -515,46 +571,30 @@ def search_nexar(part_number, client_id, client_secret, _token_cache):
         )
         print(f"[NEXAR] GraphQL HTTP status: {r.status_code}")
         r.raise_for_status()
-
         rj = r.json()
-
         if rj.get("errors"):
-            print(f"[NEXAR] ❌ GraphQL errors: {rj['errors']}")
-            return None
+            print(f"[NEXAR] ❌ GraphQL errors: {rj['errors']}"); return None
 
-        results_list = (
-            (rj.get("data") or {})
-            .get("supSearchMpn") or {}
-        ).get("results") or []
-
+        results_list = ((rj.get("data") or {}).get("supSearchMpn") or {}).get("results") or []
         print(f"[NEXAR] Results returned: {len(results_list)}")
-
         if not results_list:
-            print("[NEXAR] ❌ No results found")
-            return None
+            print("[NEXAR] ❌ No results found"); return None
 
-        # Find exact MPN match first, fall back to first result
         part_data = None
         pn_upper  = part_number.upper()
         for res in results_list:
-            if not res:
-                continue
+            if not res: continue
             pd_cand = res.get("part")
             if pd_cand and (pd_cand.get("mpn") or "").upper() == pn_upper:
-                part_data = pd_cand
-                break
+                part_data = pd_cand; break
         if part_data is None:
             for res in results_list:
                 if res and res.get("part"):
-                    part_data = res["part"]
-                    break
-
+                    part_data = res["part"]; break
         if not part_data:
-            print("[NEXAR] ❌ No valid part data in any result")
-            return None
+            print("[NEXAR] ❌ No valid part data"); return None
 
         print(f"[NEXAR] Using part: {part_data.get('mpn')}")
-
         sellers = part_data.get("sellers") or []
         print(f"[NEXAR] Sellers found: {len(sellers)}")
 
@@ -564,85 +604,53 @@ def search_nexar(part_number, client_id, client_secret, _token_cache):
         best_stock  = 0
 
         for seller in sellers:
-            # ── Guard: skip None seller entries ──────────────────────────
-            if not seller:
-                continue
+            if not seller: continue
             seller_name = ((seller.get("company") or {}).get("name") or "Unknown")
             offers      = seller.get("offers") or []
-
             for offer in offers:
-                # ── Guard: skip None offer entries ────────────────────────
-                if not offer:
-                    continue
-
-                prices      = offer.get("prices") or []
-                inv_level   = offer.get("inventoryLevel") or 0
-                stock       = int(safe_float(inv_level, default=0))
-
+                if not offer: continue
+                prices    = offer.get("prices") or []
+                inv_level = offer.get("inventoryLevel") or 0
+                stock     = int(safe_float(inv_level, default=0))
                 if prices:
                     valid_prices = []
-                    for p in prices:
-                        if not p:
-                            continue
-                        # Accept USD or unspecified currency
-                        curr = (p.get("currency") or "").upper()
-                        if curr not in ("USD", ""):
-                            continue
-                        v = safe_float(p.get("price"))
-                        if pd.notna(v) and v > 0:
-                            valid_prices.append(v)
-
+                    for p_item in prices:
+                        if not p_item: continue
+                        curr = (p_item.get("currency") or "").upper()
+                        if curr not in ("USD", ""): continue
+                        v = parse_price_robust(p_item.get("price"))
+                        if pd.notna(v): valid_prices.append(v)
                     print(f"[NEXAR]   Seller={seller_name} SKU={offer.get('sku')} "
                           f"Stock={stock} Prices={valid_prices}")
-
                     if valid_prices:
                         min_p = min(valid_prices)
-                        # Prefer lower price; break ties by higher stock
-                        if min_p < best_price or (
-                            min_p == best_price and stock > best_stock
-                        ):
-                            best_price  = min_p
-                            best_offer  = offer
-                            best_seller = seller_name
-                            best_stock  = stock
-                            print(f"[NEXAR] ✅ New best: price={min_p}, stock={stock}")
-
+                        if min_p < best_price or (min_p == best_price and stock > best_stock):
+                            best_price = min_p; best_offer = offer
+                            best_seller = seller_name; best_stock = stock
                 else:
-                    # No pricing — still useful as a stock-only fallback
                     if stock > 0 and best_offer is None:
-                        best_offer  = offer
-                        best_seller = seller_name
-                        best_stock  = stock
-                        print(f"[NEXAR] ⚠️ Stock-only offer (no pricing): {seller_name}")
+                        best_offer = offer; best_seller = seller_name; best_stock = stock
 
         if not best_offer:
-            print("[NEXAR] ❌ No valid offer found across all sellers")
-            return None
+            print("[NEXAR] ❌ No valid offer found"); return None
 
-        # ── Build normalised price breaks ────────────────────────────────
         pricing = []
-        for p in (best_offer.get("prices") or []):
-            if not p:
-                continue
-            curr = (p.get("currency") or "").upper()
-            if curr not in ("USD", ""):
-                continue
+        for p_item in (best_offer.get("prices") or []):
+            if not p_item: continue
+            curr = (p_item.get("currency") or "").upper()
+            if curr not in ("USD", ""): continue
             try:
-                q = int(safe_float(p.get("quantity", 1), default=1))
-                v = safe_float(p.get("price"))
-                if q > 0 and pd.notna(v) and v > 0:
+                q = int(safe_float(p_item.get("quantity", 1), default=1))
+                v = parse_price_robust(p_item.get("price"))
+                if q > 0 and pd.notna(v):
                     pricing.append({"qty": q, "price": v})
-            except:
-                pass
+            except: pass
         pricing = sorted(pricing, key=lambda x: x["qty"])
-
         print(f"[NEXAR] Final pricing tiers: {pricing}")
 
         lt_raw  = best_offer.get("factoryLeadDays")
         lt_days = int(safe_float(lt_raw)) if pd.notna(safe_float(lt_raw)) else np.nan
-
-        print(f"[NEXAR] ✅ Returning: seller={best_seller}, "
-              f"stock={best_offer.get('inventoryLevel')}, lt={lt_days}")
+        print(f"[NEXAR] ✅ Returning: seller={best_seller}, stock={best_offer.get('inventoryLevel')}, lt={lt_days}")
 
         return {
             "Source":                 best_seller or "Nexar",
@@ -659,6 +667,8 @@ def search_nexar(part_number, client_id, client_secret, _token_cache):
             "Discontinued":           False,
             "EndOfLife":              False,
             "DatasheetUrl":           ((part_data.get("bestDatasheet") or {}).get("url") or ""),
+            "Alternatives":           [],
+            "ROHSStatus":             "",
         }
 
     except Exception as e:
@@ -666,17 +676,16 @@ def search_nexar(part_number, client_id, client_secret, _token_cache):
         import traceback; traceback.print_exc()
         return None
 
-def get_part_data_parallel(part_number, mouser_key, nexar_id, nexar_secret, nexar_token_cache):
-    """Fetch from all enabled suppliers in parallel. Returns dict of {supplier: result}."""
+
+def get_part_data_parallel(part_number, mouser_key, nexar_id, nexar_secret,
+                            nexar_token_cache, mouser_currency="INR"):
     results = {}
     tasks   = {}
-
     with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="API") as ex:
         if mouser_key:
-            tasks[ex.submit(search_mouser, part_number, mouser_key)] = "Mouser"
+            tasks[ex.submit(search_mouser, part_number, mouser_key, mouser_currency)] = "Mouser"
         if nexar_id and nexar_secret:
             tasks[ex.submit(search_nexar, part_number, nexar_id, nexar_secret, nexar_token_cache)] = "Nexar"
-
         for future in as_completed(tasks, timeout=30):
             name = tasks[future]
             try:
@@ -688,20 +697,16 @@ def get_part_data_parallel(part_number, mouser_key, nexar_id, nexar_secret, nexa
 
 
 def analyze_single_part(bom_pn, bom_mfg, bom_qty_per_unit, config,
-                        mouser_key, nexar_id, nexar_secret, nexar_token_cache):
-    """
-    Core single-part analysis. Faithful port of BOMAnalyzerApp.analyze_single_part.
-    Returns dict with all fields for display and strategy engine.
-    """
-    total_units       = config.get("total_units", 100)
-    buy_up_pct        = config.get("buy_up_threshold", 1.0)
-    custom_tariffs    = config.get("custom_tariff_rates", {})
-    total_qty_needed  = int(bom_qty_per_unit * total_units)
+                        mouser_key, nexar_id, nexar_secret, nexar_token_cache,
+                        mouser_currency="INR"):
+    total_units      = config.get("total_units", 100)
+    buy_up_pct       = config.get("buy_up_threshold", 1.0)
+    custom_tariffs   = config.get("custom_tariff_rates", {})
+    total_qty_needed = int(bom_qty_per_unit * total_units)
 
-    # Fetch data
-    supplier_data = get_part_data_parallel(bom_pn, mouser_key, nexar_id, nexar_secret, nexar_token_cache)
+    supplier_data = get_part_data_parallel(bom_pn, mouser_key, nexar_id, nexar_secret,
+                                           nexar_token_cache, mouser_currency)
 
-    # No data found case
     if not supplier_data:
         return {
             "PartNumber": bom_pn, "Manufacturer": bom_mfg or "N/A",
@@ -711,12 +716,17 @@ def analyze_single_part(bom_pn, bom_mfg, bom_qty_per_unit, config,
             "BestCostPer": "N/A", "BestTotalCost": "N/A", "ActualBuyQty": "N/A",
             "BestCostLT": "N/A", "BestCostSrc": "N/A",
             "Description": "No supplier data — check API keys",
-            "Notes": "No data", "_options": [], "_valid": False,
+            "Notes": "No data", "Alternatives": [], "_options": [], "_valid": False,
         }
 
-    # Build options list
-    all_options = []
+    all_options  = []
+    # Collect all alternatives across sources
+    all_alts = []
     for src_name, sd in supplier_data.items():
+        for alt in (sd.get("Alternatives") or []):
+            if alt not in all_alts:
+                all_alts.append(alt)
+
         pricing = sd.get("Pricing", [])
         moq     = sd.get("MinOrderQty", 1)
         unit_p, total_c, act_qty, notes = get_optimal_cost(
@@ -730,52 +740,46 @@ def analyze_single_part(bom_pn, bom_mfg, bom_qty_per_unit, config,
             effective_lt = 0 if stock >= total_qty_needed else (lt_days if pd.notna(lt_days) else np.inf)
 
         all_options.append({
-            "source":          sd.get("Source", src_name),
-            "SourcePartNumber": sd.get("SourcePartNumber","N/A"),
+            "source":               sd.get("Source", src_name),
+            "SourcePartNumber":     sd.get("SourcePartNumber","N/A"),
             "ManufacturerPartNumber": sd.get("ManufacturerPartNumber", bom_pn),
-            "Manufacturer":    sd.get("Manufacturer", bom_mfg or "N/A"),
-            "Description":     sd.get("Description",""),
-            "stock":           stock,
-            "lead_time":       lt_days if pd.notna(lt_days) else np.inf,
-            "effective_lead":  effective_lt,
-            "unit_cost":       unit_p,
-            "cost":            total_c,
-            "actual_order_qty": act_qty,
-            "notes":           notes,
-            "coo":             sd.get("CountryOfOrigin","Unknown"),
-            "eol":             sd.get("EndOfLife", False),
-            "discontinued":    sd.get("Discontinued", False),
-            "lifecycle":       "EOL" if sd.get("EndOfLife") else ("DISC" if sd.get("Discontinued") else "Active"),
-            "DatasheetUrl":    sd.get("DatasheetUrl",""),
-            "pricing":         pricing,
-            "moq":             moq,
-            "bom_pn":          bom_pn,
-            "total_qty_needed": total_qty_needed,
+            "Manufacturer":         sd.get("Manufacturer", bom_mfg or "N/A"),
+            "Description":          sd.get("Description",""),
+            "stock":                stock,
+            "lead_time":            lt_days if pd.notna(lt_days) else np.inf,
+            "effective_lead":       effective_lt,
+            "unit_cost":            unit_p,
+            "cost":                 total_c,
+            "actual_order_qty":     act_qty,
+            "notes":                notes,
+            "coo":                  sd.get("CountryOfOrigin","Unknown"),
+            "eol":                  sd.get("EndOfLife", False),
+            "discontinued":         sd.get("Discontinued", False),
+            "lifecycle":            "EOL" if sd.get("EndOfLife") else ("DISC" if sd.get("Discontinued") else "Active"),
+            "DatasheetUrl":         sd.get("DatasheetUrl",""),
+            "pricing":              pricing,
+            "moq":                  moq,
+            "bom_pn":               bom_pn,
+            "total_qty_needed":     total_qty_needed,
+            "rohs":                 sd.get("ROHSStatus",""),
         })
 
-    # Consolidate COO, lifecycle
     consolidated_coo = "Unknown"
     for opt in all_options:
         if opt["coo"] not in ("Unknown","N/A",""):
-            consolidated_coo = opt["coo"]
-            break
+            consolidated_coo = opt["coo"]; break
 
     lifecycle_notes = ""
     for opt in all_options:
         if opt.get("eol"):         lifecycle_notes = "EOL"
         elif opt.get("discontinued"): lifecycle_notes = "DISC" if not lifecycle_notes else lifecycle_notes
 
-    # Valid options (have pricing)
     valid_options = [
         o for o in all_options
-        if (
-            pd.notna(o.get("cost")) or
-            o.get("stock", 0) > 0
-            )]
-    # Best cost option (lowest total cost)
+        if pd.notna(o.get("cost")) or o.get("stock", 0) > 0
+    ]
     best_cost_option = min(valid_options, key=lambda o: o.get("cost", np.inf)) if valid_options else None
 
-    # Fastest option (lowest effective lead time then cost)
     fastest_option = None
     if all_options:
         in_stock = [o for o in all_options if o.get("stock",0) >= total_qty_needed]
@@ -786,25 +790,20 @@ def analyze_single_part(bom_pn, bom_mfg, bom_qty_per_unit, config,
             if with_lt:
                 fastest_option = min(with_lt, key=lambda o: o.get("lead_time", np.inf))
 
-    total_stock = sum(o.get("stock",0) for o in all_options)
-
-    # Risk scoring
-    fastest_lt = fastest_option.get("lead_time", np.inf) if fastest_option else np.inf
-    if isinstance(fastest_lt, float) and np.isinf(fastest_lt): fastest_lt_days = np.nan
-    else: fastest_lt_days = fastest_lt
+    total_stock   = sum(o.get("stock",0) for o in all_options)
+    fastest_lt    = fastest_option.get("lead_time", np.inf) if fastest_option else np.inf
+    fastest_lt_days = np.nan if (isinstance(fastest_lt, float) and np.isinf(fastest_lt)) else fastest_lt
 
     risk_score, risk_factors = calculate_risk_score(
-        sourcing_count   = len(valid_options),
-        stock_available  = total_stock,
-        qty_needed       = total_qty_needed,
-        lead_time_days   = fastest_lt_days,
-        lifecycle_notes  = lifecycle_notes,
-        coo              = consolidated_coo,
+        sourcing_count  = len(valid_options),
+        stock_available = total_stock,
+        qty_needed      = total_qty_needed,
+        lead_time_days  = fastest_lt_days,
+        lifecycle_notes = lifecycle_notes,
+        coo             = consolidated_coo,
     )
-
     tariff_rate = get_tariff_rate(consolidated_coo, custom_tariffs)
-
-    status = "Active"
+    status      = "Active"
     if "EOL" in lifecycle_notes: status = "EOL"
     elif "DISC" in lifecycle_notes: status = "Discontinued"
 
@@ -812,14 +811,12 @@ def analyze_single_part(bom_pn, bom_mfg, bom_qty_per_unit, config,
     if total_stock < total_qty_needed: notes_list.append("Stock Gap")
     if best_cost_option and best_cost_option.get("notes"): notes_list.append(best_cost_option["notes"])
 
-    # Best cost unit price with tariff
     bc_unit  = best_cost_option.get("unit_cost", np.nan) if best_cost_option else np.nan
     bc_total = best_cost_option.get("cost", np.nan) if best_cost_option else np.nan
     bc_qty   = best_cost_option.get("actual_order_qty","N/A") if best_cost_option else "N/A"
     bc_lt    = best_cost_option.get("lead_time", np.inf) if best_cost_option else np.inf
     bc_src   = best_cost_option.get("source","N/A") if best_cost_option else "N/A"
-
-    desc = (best_cost_option or (all_options[0] if all_options else {})).get("Description","")
+    desc     = (best_cost_option or (all_options[0] if all_options else {})).get("Description","")
 
     return {
         "PartNumber":    bom_pn,
@@ -836,7 +833,7 @@ def analyze_single_part(bom_pn, bom_mfg, bom_qty_per_unit, config,
         "RiskFactors":   risk_factors,
         "BestCostPer":   f"{bc_unit:.4f}" if pd.notna(bc_unit) else "N/A",
         "BestCostPerRaw": bc_unit,
-        "BestTotalCost": (f"{bc_total:.2f}" if pd.notna(bc_total)else "Quote Required"),
+        "BestTotalCost": (f"{bc_total:.2f}" if pd.notna(bc_total) else "Quote Required"),
         "BestTotalCostRaw": bc_total,
         "BestTotalWithTariff": (bc_total * (1 + tariff_rate)) if pd.notna(bc_total) else np.nan,
         "ActualBuyQty":  str(bc_qty),
@@ -845,39 +842,35 @@ def analyze_single_part(bom_pn, bom_mfg, bom_qty_per_unit, config,
         "Description":   desc,
         "Notes":         "; ".join(notes_list),
         "DatasheetUrl":  (best_cost_option or {}).get("DatasheetUrl",""),
+        "Alternatives":  all_alts,          # ← NEW
         "_options":      all_options,
         "_valid":        bool(valid_options),
     }
 
 
 def calculate_strategies(part_results, config):
-    """
-    Port of calculate_summary_metrics strategy engine.
-    Returns dict of strategy summaries.
-    """
-    total_units   = config.get("total_units", 100)
-    target_lt     = config.get("target_lead_time_days", 56)
-    max_premium   = config.get("max_premium", 15.0)
-    cost_weight   = config.get("cost_weight", 0.5)
-    lead_weight   = config.get("lead_time_weight", 0.5)
-    buy_up_pct    = config.get("buy_up_threshold", 1.0)
+    total_units  = config.get("total_units", 100)
+    target_lt    = config.get("target_lead_time_days", 56)
+    max_premium  = config.get("max_premium", 15.0)
+    cost_weight  = config.get("cost_weight", 0.5)
+    lead_weight  = config.get("lead_time_weight", 0.5)
+    buy_up_pct   = config.get("buy_up_threshold", 1.0)
 
     strategies = {
-        "Lowest Cost (Strict)":      {"total_cost": 0.0, "max_lt": 0, "parts": {}, "invalid": False},
-        "Lowest Cost (In Stock)":    {"total_cost": 0.0, "max_lt": 0, "parts": {}, "invalid": False},
-        "Fastest Lead Time":         {"total_cost": 0.0, "max_lt": 0, "parts": {}, "invalid": False},
-        "Optimized (Cost+LT)":       {"total_cost": 0.0, "max_lt": 0, "parts": {}, "invalid": False},
+        "Lowest Cost (Strict)":   {"total_cost": 0.0, "max_lt": 0, "parts": {}, "invalid": False},
+        "Lowest Cost (In Stock)": {"total_cost": 0.0, "max_lt": 0, "parts": {}, "invalid": False},
+        "Fastest Lead Time":      {"total_cost": 0.0, "max_lt": 0, "parts": {}, "invalid": False},
+        "Optimized (Cost+LT)":    {"total_cost": 0.0, "max_lt": 0, "parts": {}, "invalid": False},
     }
 
     for part in part_results:
         if not part.get("_valid"): continue
-        opts        = part["_options"]
-        pn          = part["PartNumber"]
-        qty_needed  = part["QtyNeed"]
-        valid_opts  = [o for o in opts if pd.notna(o.get("cost")) and o.get("cost", np.inf) != np.inf]
+        opts       = part["_options"]
+        pn         = part["PartNumber"]
+        qty_needed = part["QtyNeed"]
+        valid_opts = [o for o in opts if pd.notna(o.get("cost")) and o.get("cost", np.inf) != np.inf]
         if not valid_opts: continue
 
-        # ── Lowest Cost Strict ─────────────────────────────────────────────
         best = min(valid_opts, key=lambda o: o.get("cost", np.inf))
         strategies["Lowest Cost (Strict)"]["parts"][pn]  = best
         strategies["Lowest Cost (Strict)"]["total_cost"] += best.get("cost", 0)
@@ -885,13 +878,11 @@ def calculate_strategies(part_results, config):
         if not (isinstance(lt, float) and np.isinf(lt)):
             strategies["Lowest Cost (Strict)"]["max_lt"] = max(strategies["Lowest Cost (Strict)"]["max_lt"], int(lt or 0))
 
-        # ── Lowest Cost In-Stock ───────────────────────────────────────────
         in_stock = [o for o in valid_opts if o.get("stock",0) >= qty_needed]
         chosen   = min(in_stock, key=lambda o: o.get("cost", np.inf)) if in_stock else best
         strategies["Lowest Cost (In Stock)"]["parts"][pn]  = chosen
         strategies["Lowest Cost (In Stock)"]["total_cost"] += chosen.get("cost", 0)
 
-        # ── Fastest Lead Time ──────────────────────────────────────────────
         def eff_lt(o): return 0 if o.get("stock",0) >= qty_needed else o.get("lead_time", np.inf)
         fastest = min(valid_opts, key=lambda o: (eff_lt(o), o.get("cost", np.inf)))
         strategies["Fastest Lead Time"]["parts"][pn]  = fastest
@@ -900,26 +891,22 @@ def calculate_strategies(part_results, config):
         if not (isinstance(flt, float) and np.isinf(flt)):
             strategies["Fastest Lead Time"]["max_lt"] = max(strategies["Fastest Lead Time"]["max_lt"], int(flt or 0))
 
-        # ── Optimized (Cost + Lead Time) ───────────────────────────────────
         baseline_cost = best.get("cost", np.inf)
         constrained   = []
         for o in valid_opts:
-            cost_o    = o.get("cost", np.inf)
-            eff_lt_o  = eff_lt(o)
+            cost_o   = o.get("cost", np.inf)
+            eff_lt_o = eff_lt(o)
             if eff_lt_o == np.inf or eff_lt_o > target_lt: continue
-            if baseline_cost > 1e-9:
-                prem = (cost_o - baseline_cost) / baseline_cost * 100
-            else:
-                prem = 0
+            prem = (cost_o - baseline_cost) / baseline_cost * 100 if baseline_cost > 1e-9 else 0
             if prem > max_premium: continue
             constrained.append(o)
 
         if constrained:
-            costs = [safe_float(o.get("cost")) for o in constrained]
-            lts   = [eff_lt(o) for o in constrained if eff_lt(o) != np.inf]
-            min_c = min(costs) if costs else 0; max_c = max(costs) if costs else 1
-            min_l = min(lts)   if lts   else 0; max_l = max(lts)   if lts   else 1
-            c_rng = max(max_c - min_c, 1e-9); l_rng = max(max_l - min_l, 1e-9)
+            costs  = [safe_float(o.get("cost")) for o in constrained]
+            lts    = [eff_lt(o) for o in constrained if eff_lt(o) != np.inf]
+            min_c  = min(costs) if costs else 0; max_c = max(costs) if costs else 1
+            min_l  = min(lts)   if lts   else 0; max_l = max(lts)   if lts   else 1
+            c_rng  = max(max_c - min_c, 1e-9); l_rng = max(max_l - min_l, 1e-9)
             best_score = np.inf; opt_chosen = None
             for o in constrained:
                 nc    = (safe_float(o.get("cost")) - min_c) / c_rng
@@ -927,10 +914,9 @@ def calculate_strategies(part_results, config):
                 score = cost_weight * nc + lead_weight * nl
                 if o.get("eol") or o.get("discontinued"): score += 0.5
                 if o.get("stock",0) < qty_needed: score += 0.1
-                if score < best_score:
-                    best_score = score; opt_chosen = o
+                if score < best_score: best_score = score; opt_chosen = o
         else:
-            opt_chosen = fastest  # fallback
+            opt_chosen = fastest
 
         strategies["Optimized (Cost+LT)"]["parts"][pn]  = opt_chosen or best
         strategies["Optimized (Cost+LT)"]["total_cost"] += (opt_chosen or best).get("cost", 0)
@@ -941,65 +927,38 @@ def calculate_strategies(part_results, config):
     return strategies
 
 
-import requests
-
 def openai_ai_summary(data_context, openai_key, model="gpt-4o-mini"):
-    """
-    Call OpenAI API to generate executive AI summary.
-    SSL verification disabled for corporate environments.
-    """
     if not openai_key:
         return "⚠️ Add your OpenAI API key in the sidebar to enable AI summaries."
-
     system_prompt = (
         "You are a strategic supply chain advisor specializing in electronic components. "
         "Provide concise, actionable insights for executive review. "
         "Focus on risk, cost optimization, and build readiness."
     )
-
-    headers = {
-        "Authorization": f"Bearer {openai_key}",
-        "Content-Type": "application/json",
-    }
-
+    headers = {"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"}
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": data_context},
-        ],
-        "max_tokens": 1200,
-        "temperature": 0.6,
+        "messages": [{"role":"system","content":system_prompt},{"role":"user","content":data_context}],
+        "max_tokens": 1200, "temperature": 0.6,
     }
-
     try:
         response = requests.post(
             "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            verify=False,   # ✅ corporate SSL interception
-            timeout=60,
+            headers=headers, json=payload, verify=False, timeout=60,
         )
-
         if response.status_code == 200:
-            result = response.json()
-            return result["choices"][0]["message"]["content"].strip()
-
+            return response.json()["choices"][0]["message"]["content"].strip()
         elif response.status_code == 401:
             return "❌ Invalid OpenAI API key."
-
         elif response.status_code == 429:
             return "⚠️ Rate limit exceeded or insufficient OpenAI quota."
-
         else:
             return f"OpenAI API error {response.status_code}: {response.text}"
-
     except requests.exceptions.RequestException as e:
         return f"Error calling OpenAI: {e}"
 
 
-
-# ── Streamlit Color Helpers ────────────────────────────────────────────────────
+# ── Streamlit Helpers ─────────────────────────────────────────────────────────
 
 def color_risk_cell(val):
     if not isinstance(val, (int, float)): return ""
@@ -1011,38 +970,58 @@ def color_risk_cell(val):
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### 🔬 BOM Analyzer")
-    st.caption("Web Edition v1.0.0 — PCB Department")
+    st.caption("Web Edition v1.1.0 — PCB Department")
     st.divider()
 
     st.markdown("**🔑 Supplier API Keys**")
     mouser_key   = st.text_input("Mouser API Key",      type="password",
                                   placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+
+    # ── Mouser region / currency ───────────────────────────────────────────
+    # mouser.in accounts are issued INR keys. mouser.com → USD. mouser.de → EUR.
+    # The apiCurrency param MUST match your account's registered currency or
+    # Mouser returns PriceBreaks:[] (empty) for every part.
+    CURRENCY_OPTIONS = {
+        "INR  — mouser.in  (India)":       "INR",
+        "USD  — mouser.com (USA/Global)":  "USD",
+        "EUR  — mouser.de  (Europe)":      "EUR",
+        "GBP  — mouser.co.uk (UK)":        "GBP",
+        "JPY  — mouser.jp  (Japan)":       "JPY",
+        "AUD  — mouser.com.au (Australia)":"AUD",
+    }
+    currency_label  = st.selectbox(
+        "Mouser Account Region / Currency",
+        list(CURRENCY_OPTIONS.keys()),
+        index=0,
+        help="Select the portal where your Mouser API key was created. "
+             "This sets apiCurrency in every request — wrong value = no pricing.",
+    )
+    mouser_currency = CURRENCY_OPTIONS[currency_label]
+    CURRENCY_SYMBOLS = {"INR":"₹","USD":"$","EUR":"€","GBP":"£","JPY":"¥","AUD":"A$"}
+    currency_symbol  = CURRENCY_SYMBOLS.get(mouser_currency, mouser_currency + " ")
+
     nexar_id     = st.text_input("Nexar Client ID",     type="password", placeholder="nexar.com")
     nexar_secret = st.text_input("Nexar Client Secret", type="password", placeholder="nexar.com")
 
     st.divider()
     openai_key = st.text_input("OpenAI API Key", type="password")
 
-    # ── API Status Indicators ─────────────────────────────────────────────
     st.divider()
     st.markdown("**📡 API Status**")
     col_s1, col_s2, col_s3 = st.columns(3)
-    col_s1.markdown("🟢 Mouser" if mouser_key   else "⚫ Mouser")
-    col_s2.markdown("🟢 Nexar"  if (nexar_id and nexar_secret) else "⚫ Nexar")
-    col_s3.markdown("🟢 OpenAI"   if openai_key     else "⚫ OpenAI")
+    col_s1.markdown("🟢 Mouser" if mouser_key                    else "⚫ Mouser")
+    col_s2.markdown("🟢 Nexar"  if (nexar_id and nexar_secret)   else "⚫ Nexar")
+    col_s3.markdown("🟢 OpenAI" if openai_key                    else "⚫ OpenAI")
     st.caption("Keys are session-only and never stored.")
 
     st.divider()
     st.markdown("**🏗️ Build Configuration**")
     total_units     = st.number_input("Total Units to Build", min_value=1, value=100, step=10)
-    target_lt_days  = st.number_input("Target Lead Time (days)", min_value=1, value=56, step=7,
-                                       help="Maximum acceptable lead time for Optimized strategy")
-    max_premium_pct = st.number_input("Max Cost Premium % (Optimized)", min_value=0.0, value=15.0, step=1.0,
-                                       help="How much more expensive than cheapest option is acceptable")
+    target_lt_days  = st.number_input("Target Lead Time (days)", min_value=1, value=56, step=7)
+    max_premium_pct = st.number_input("Max Cost Premium % (Optimized)", min_value=0.0, value=15.0, step=1.0)
     cost_w  = st.slider("Cost Weight",      0.0, 1.0, 0.50, 0.05)
     lead_w  = st.slider("Lead Time Weight", 0.0, 1.0, 0.50, 0.05)
-    buy_up  = st.number_input("Buy-Up Threshold %", min_value=0.0, value=1.0, step=0.5,
-                               help="Allow buying to next price break if cost increase is within this %")
+    buy_up  = st.number_input("Buy-Up Threshold %", min_value=0.0, value=1.0, step=0.5)
 
     st.divider()
     st.markdown("**🌍 Custom Tariff Rates (%)**")
@@ -1067,13 +1046,14 @@ config = {
     "lead_time_weight":      lead_w,
     "buy_up_threshold":      buy_up,
     "custom_tariff_rates":   custom_tariffs,
+    "mouser_currency":       mouser_currency,
+    "currency_symbol":       currency_symbol,
 }
 
 # ── Main Page ─────────────────────────────────────────────────────────────────
 st.markdown('<div class="title-bar">🔬 BOM Analyzer</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Supply Chain BOM Optimizer · Risk Scoring · AI-Powered Insights (OpenAI)</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Supply Chain BOM Optimizer · Risk Scoring · AI-Powered Insights (OpenAI) · v1.1.0</div>', unsafe_allow_html=True)
 
-# ── BOM Upload ─────────────────────────────────────────────────────────────────
 st.markdown('<div class="section-head">📂 Step 1 — Upload Your BOM</div>', unsafe_allow_html=True)
 
 col_up, col_tmpl = st.columns([3,1])
@@ -1093,11 +1073,10 @@ with col_tmpl:
 if uploaded:
     try:
         raw_df = pd.read_csv(uploaded, skipinitialspace=True, on_bad_lines='skip')
-        # Collapse any embedded newlines inside fields (common Excel CSV export artifact)
-        raw_df = raw_df.apply(lambda col: col.map(lambda v: str(v).replace("\n"," ").replace("\r","").strip() if isinstance(v, str) else v))
+        raw_df = raw_df.apply(lambda col: col.map(
+            lambda v: str(v).replace("\n"," ").replace("\r","").strip() if isinstance(v, str) else v))
         raw_df.columns = [c.strip() for c in raw_df.columns]
 
-        # Normalize columns (same logic as source startup guide)
         col_map = {}
         for c in raw_df.columns:
             cl = c.lower().replace(" ","").replace("_","").replace(".","")
@@ -1116,7 +1095,6 @@ if uploaded:
         raw_df["Manufacturer"] = raw_df.get("Manufacturer", pd.Series([""] * len(raw_df))).fillna("").astype(str)
         raw_df = raw_df[raw_df["Part Number"].str.len() > 0].dropna(subset=["Part Number"])
 
-        # ── Auto-clean part numbers & report changes ───────────────────────
         cleaned_log = []
         def apply_clean(pn):
             cleaned, original, changes = clean_part_number(pn)
@@ -1125,8 +1103,7 @@ if uploaded:
             return cleaned
         raw_df["Part Number"] = raw_df["Part Number"].apply(apply_clean)
         if cleaned_log:
-            with st.expander(f"🔧 Auto-cleaned {len(cleaned_log)} part number(s) — click to review", expanded=True):
-                st.caption("These part numbers had formatting issues (apostrophes, suffixes) that were automatically fixed before sending to supplier APIs.")
+            with st.expander(f"🔧 Auto-cleaned {len(cleaned_log)} part number(s)", expanded=True):
                 st.dataframe(pd.DataFrame(cleaned_log), use_container_width=True, hide_index=True)
 
         st.success(f"✅ BOM loaded: **{len(raw_df)} parts**, {raw_df['Quantity'].sum()} total component placements")
@@ -1137,10 +1114,45 @@ if uploaded:
         st.markdown('<div class="section-head">🚀 Step 2 — Run Analysis</div>', unsafe_allow_html=True)
 
         if not (mouser_key or (nexar_id and nexar_secret)):
-            st.warning("⚠️ No supplier API keys entered — results will show 'Not Found'. "
-                       "Add Mouser or Nexar keys in the sidebar for live pricing data.")
+            st.warning("⚠️ No supplier API keys entered. Add Mouser or Nexar keys in the sidebar.")
 
         run_btn = st.button("▶️ Run BOM Analysis", type="primary", use_container_width=True)
+
+        # ── Pre-run KPI placeholder ────────────────────────────────────────
+        # Show skeleton cards so the layout doesn't jump when results load.
+        # Cost cards are intentionally greyed out — they require the API run.
+        if "results" not in st.session_state:
+            st.divider()
+            st.markdown('<div class="section-head">📊 Results</div>', unsafe_allow_html=True)
+            st.markdown(
+                f"""
+                <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-bottom:12px;">
+                  <div class="kpi-card cost">
+                    <div class="kpi-label">Total BOM Cost ({mouser_currency})</div>
+                    <div class="kpi-pending">Run analysis</div>
+                    <div class="kpi-sub">Sum of best unit price × qty</div>
+                  </div>
+                  <div class="kpi-card tariff">
+                    <div class="kpi-label">Cost with Tariffs ({mouser_currency})</div>
+                    <div class="kpi-pending">Run analysis</div>
+                    <div class="kpi-sub">Includes applicable import duties</div>
+                  </div>
+                  <div class="kpi-card impact">
+                    <div class="kpi-label">Tariff Impact ({mouser_currency})</div>
+                    <div class="kpi-pending">Run analysis</div>
+                    <div class="kpi-sub">Additional cost due to tariffs</div>
+                  </div>
+                </div>
+                <div style="display:grid; grid-template-columns:repeat(5,1fr); gap:12px;">
+                  <div class="kpi-card high"><div class="kpi-label">🔴 High Risk</div><div class="kpi-pending">—</div></div>
+                  <div class="kpi-card mod"><div class="kpi-label">🟡 Moderate</div><div class="kpi-pending">—</div></div>
+                  <div class="kpi-card low"><div class="kpi-label">🟢 Low Risk</div><div class="kpi-pending">—</div></div>
+                  <div class="kpi-card eol"><div class="kpi-label">⚠️ EOL / Not Found</div><div class="kpi-pending">—</div></div>
+                  <div class="kpi-card"><div class="kpi-label">📦 Stock Gaps</div><div class="kpi-pending">—</div></div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
         if run_btn:
             st.session_state.pop("results", None)
@@ -1148,22 +1160,23 @@ if uploaded:
             st.session_state.pop("ai_summary", None)
 
             nexar_token_cache = {}
-            results = []
-            progress_bar = st.progress(0, text="Starting analysis...")
-            status_txt   = st.empty()
-            total_parts  = len(raw_df)
+            results           = []
+            progress_bar      = st.progress(0, text="Starting analysis...")
+            status_txt        = st.empty()
+            total_parts       = len(raw_df)
 
             for i, row in raw_df.iterrows():
-                pn   = str(row["Part Number"]).strip()
-                qty  = int(row["Quantity"])
-                mfg  = str(row.get("Manufacturer","")).strip()
+                pn  = str(row["Part Number"]).strip()
+                qty = int(row["Quantity"])
+                mfg = str(row.get("Manufacturer","")).strip()
                 status_txt.text(f"🔍 {pn}  ({len(results)+1}/{total_parts})")
                 progress_bar.progress((len(results)+1)/total_parts, text=f"Analyzing {pn}…")
-
                 result = analyze_single_part(pn, mfg, qty, config,
-                                             mouser_key, nexar_id, nexar_secret, nexar_token_cache)
+                                             mouser_key, nexar_id, nexar_secret,
+                                             nexar_token_cache,
+                                             mouser_currency=mouser_currency)
                 results.append(result)
-                time.sleep(0.1)  # polite rate-limiting
+                time.sleep(0.1)
 
             progress_bar.empty(); status_txt.empty()
             st.session_state["results"]    = results
@@ -1177,54 +1190,103 @@ if uploaded:
 
             valid_results = [r for r in results if r.get("_valid")]
 
-            # KPI metrics
             total_cost_best   = sum(v for r in valid_results if pd.notna(v := r.get("BestTotalCostRaw") or 0))
             total_cost_tariff = sum(v for r in valid_results if pd.notna(v := r.get("BestTotalWithTariff") or 0))
             tariff_impact     = total_cost_tariff - total_cost_best
-            high_risk   = sum(1 for r in results if r.get("RiskScore",0) >= 6.6)
-            mod_risk    = sum(1 for r in results if 3.6 <= r.get("RiskScore",0) < 6.6)
-            low_risk    = sum(1 for r in results if r.get("RiskScore",0) < 3.6)
-            eol_count   = sum(1 for r in results if r.get("Status") in ("EOL","Discontinued"))
-            no_stock    = sum(1 for r in results if r.get("StockAvail",0) == 0)
-            not_found   = sum(1 for r in results if not r.get("_valid"))
+            high_risk  = sum(1 for r in results if r.get("RiskScore",0) >= 6.6)
+            mod_risk   = sum(1 for r in results if 3.6 <= r.get("RiskScore",0) < 6.6)
+            low_risk   = sum(1 for r in results if r.get("RiskScore",0) < 3.6)
+            eol_count  = sum(1 for r in results if r.get("Status") in ("EOL","Discontinued"))
+            no_stock   = sum(1 for r in results if r.get("StockAvail",0) == 0)
+            not_found  = sum(1 for r in results if not r.get("_valid"))
+            stock_gaps = sum(1 for r in results if r.get("StockAvail",0) < r.get("QtyNeed",0))
+            parts_with_alts = sum(1 for r in results if r.get("Alternatives"))
 
+            # ── NEW: Two-row KPI card layout ───────────────────────────────
             st.divider()
             st.markdown('<div class="section-head">📊 Results</div>', unsafe_allow_html=True)
 
-            k1,k2,k3,k4,k5,k6 = st.columns(6)
-            k1.metric("Total BOM Cost",       f"${total_cost_best:,.2f}")
-            k2.metric("Cost with Tariffs",     f"${total_cost_tariff:,.2f}", delta=f"+${tariff_impact:,.2f}")
-            k3.metric("🔴 High Risk",          high_risk)
-            k4.metric("🟡 Moderate Risk",      mod_risk)
-            k5.metric("🟢 Low Risk",           low_risk)
-            k6.metric("❌ Not Found / EOL",    f"{not_found + eol_count}")
+            # Row 1 — Cost cards (3 wide, full detail)
+            tariff_pct_str = f"({tariff_impact/total_cost_best*100:.1f}% of base)" if total_cost_best > 0 else ""
+            st.markdown(
+                f"""
+                <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-bottom:14px;">
+                  <div class="kpi-card cost">
+                    <div class="kpi-label">Total BOM Cost ({mouser_currency})</div>
+                    <div class="kpi-value">{format_cost(total_cost_best, currency_symbol, mouser_currency)}</div>
+                    <div class="kpi-sub">{len(valid_results)} of {len(results)} parts priced</div>
+                  </div>
+                  <div class="kpi-card tariff">
+                    <div class="kpi-label">Cost with Tariffs ({mouser_currency})</div>
+                    <div class="kpi-value">{format_cost(total_cost_tariff, currency_symbol, mouser_currency)}</div>
+                    <div class="kpi-sub">Duties applied per COO</div>
+                  </div>
+                  <div class="kpi-card impact">
+                    <div class="kpi-label">Tariff Impact ({mouser_currency})</div>
+                    <div class="kpi-value">{format_cost(tariff_impact, currency_symbol, mouser_currency)}</div>
+                    <div class="kpi-delta-pos">▲ {tariff_pct_str}</div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-            # ── Not Found Diagnostic ──────────────────────────────────────
+            # Row 2 — Risk / status counts (5 narrow cards)
+            st.markdown(
+                f"""
+                <div style="display:grid; grid-template-columns:repeat(5,1fr); gap:14px; margin-bottom:18px;">
+                  <div class="kpi-card high">
+                    <div class="kpi-label">🔴 High Risk</div>
+                    <div class="kpi-value">{high_risk}</div>
+                    <div class="kpi-sub">Score ≥ 6.6</div>
+                  </div>
+                  <div class="kpi-card mod">
+                    <div class="kpi-label">🟡 Moderate</div>
+                    <div class="kpi-value">{mod_risk}</div>
+                    <div class="kpi-sub">Score 3.6 – 6.5</div>
+                  </div>
+                  <div class="kpi-card low">
+                    <div class="kpi-label">🟢 Low Risk</div>
+                    <div class="kpi-value">{low_risk}</div>
+                    <div class="kpi-sub">Score &lt; 3.6</div>
+                  </div>
+                  <div class="kpi-card eol">
+                    <div class="kpi-label">⚠️ EOL / Not Found</div>
+                    <div class="kpi-value">{not_found + eol_count}</div>
+                    <div class="kpi-sub">{eol_count} EOL · {not_found} no data</div>
+                  </div>
+                  <div class="kpi-card">
+                    <div class="kpi-label">📦 Stock Gaps</div>
+                    <div class="kpi-value">{stock_gaps}</div>
+                    <div class="kpi-sub">Stock &lt; qty needed</div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
             not_found_parts = [r for r in results if not r.get("_valid")]
             if not_found_parts:
-                with st.expander(f"⚠️ {len(not_found_parts)} part(s) returned no supplier data — click for guidance", expanded=True):
+                with st.expander(f"⚠️ {len(not_found_parts)} part(s) returned no supplier data", expanded=True):
                     st.markdown("""
 **Common reasons a part returns no data:**
 - Part number has a distributor suffix (e.g. `2N3906 PBFREE` → try `2N3906`)
 - Part number starts with an apostrophe from Excel export (auto-fixed on next run)
 - Part is too new, too old, or niche for Mouser's catalog
-- Part number belongs to a manufacturer not stocked by Mouser (try Nexar)
 - Mouser daily API limit reached (1,000 calls/day free tier)
                     """)
-                    nf_rows = [{"Part Number": r["PartNumber"],
-                                "Total Qty Needed": r["QtyNeed"],
-                                "Suggestion": "Try searching manually on mouser.com or digikey.com"
+                    nf_rows = [{"Part Number": r["PartNumber"], "Total Qty Needed": r["QtyNeed"],
+                                "Suggestion": "Try searching manually on mouser.com"
                                 } for r in not_found_parts]
                     st.dataframe(pd.DataFrame(nf_rows), use_container_width=True, hide_index=True)
-                    st.caption("These parts still appear in the BOM Analysis table with Risk Score = 10 (no data = maximum risk).")
 
-            # Tabs
             tab1, tab2, tab3, tab4 = st.tabs(["📋 BOM Analysis", "💰 Strategies", "📈 Visualizations", "🤖 AI Summary"])
 
             # ── Tab 1: Full Results ────────────────────────────────────────
             with tab1:
                 display_rows = []
                 for r in results:
+                    alts = r.get("Alternatives", [])
                     display_rows.append({
                         "Part Number":    r["PartNumber"],
                         "Description":    r.get("Description","")[:60],
@@ -1232,20 +1294,20 @@ if uploaded:
                         "Total Qty":      r["QtyNeed"],
                         "Sources":        r["Sources"],
                         "Best Supplier":  r["BestCostSrc"],
-                        "Unit Cost ($)":  r.get("BestCostPerRaw", np.nan),
-                        "Total Cost ($)": r.get("BestTotalCostRaw", np.nan),
-                        "w/Tariff ($)":   r.get("BestTotalWithTariff", np.nan),
+                        "Unit Cost":      r.get("BestCostPerRaw", np.nan),
+                        "Total Cost":     r.get("BestTotalCostRaw", np.nan),
+                        "w/Tariff":       r.get("BestTotalWithTariff", np.nan),
                         "Tariff":         r["TariffPct"],
                         "Stock":          r["StockAvail"],
                         "Lead (days)":    r["BestCostLT"],
                         "COO":            r["COO"],
                         "Status":         r["Status"],
                         "Risk Score":     r["RiskScore"],
+                        "Alternatives":   f"{len(alts)} available" if alts else "—",
                         "Notes":          r.get("Notes",""),
                     })
                 res_df = pd.DataFrame(display_rows)
 
-                # Risk filter
                 risk_filter = st.radio("Filter by Risk:", ["All","🔴 High","🟡 Moderate","🟢 Low"],
                                         horizontal=True, key="risk_filter_tab1")
                 if risk_filter == "🔴 High":
@@ -1258,28 +1320,91 @@ if uploaded:
                 styled = res_df.style\
                     .map(color_risk_cell, subset=["Risk Score"])\
                     .format({
-                        "Unit Cost ($)":  lambda v: f"${v:.4f}" if pd.notna(v) else "N/A",
-                        "Total Cost ($)": lambda v: f"${v:,.2f}" if pd.notna(v) else "N/A",
-                        "w/Tariff ($)":   lambda v: f"${v:,.2f}" if pd.notna(v) else "N/A",
+                        "Unit Cost":      lambda v: f"{currency_symbol}{v:.4f}" if pd.notna(v) else "N/A",
+                        "Total Cost":     lambda v: f"{currency_symbol}{v:,.2f}" if pd.notna(v) else "N/A",
+                        "w/Tariff":       lambda v: f"{currency_symbol}{v:,.2f}" if pd.notna(v) else "N/A",
                         "Risk Score":     lambda v: f"{v:.1f}" if pd.notna(v) else "N/A",
                     })
                 st.dataframe(styled, use_container_width=True, height=500)
 
-                # Risk factor breakdown
+                # ── NEW: Per-part detail expander with pricing tiers + alternatives ──
+                st.markdown("---")
+                st.markdown("**🔍 Part Detail — Pricing Tiers & Alternatives**")
+                st.caption("Select a part to see full pricing breaks and available alternative/substitute parts.")
+
+                pn_list = [r["PartNumber"] for r in results]
+                selected_pn = st.selectbox("Select part:", pn_list, key="detail_pn_select")
+                detail_result = next((r for r in results if r["PartNumber"] == selected_pn), None)
+
+                if detail_result:
+                    dcol1, dcol2 = st.columns([1,1])
+
+                    with dcol1:
+                        st.markdown(f"**📦 Pricing Tiers** — {selected_pn}")
+                        # Collect pricing from all options
+                        all_pricing_rows = []
+                        for opt in detail_result.get("_options", []):
+                            for pb in (opt.get("pricing") or []):
+                                all_pricing_rows.append({
+                                    "Source":     opt["source"],
+                                    "Break Qty":  pb["qty"],
+                                    "Unit Price": f"{currency_symbol}{pb['price']:.4f}",
+                                    "Ext. Cost":  f"{currency_symbol}{pb['price'] * detail_result['QtyNeed']:,.2f}",
+                                })
+                        if all_pricing_rows:
+                            st.dataframe(pd.DataFrame(all_pricing_rows),
+                                         use_container_width=True, hide_index=True)
+                        else:
+                            st.warning("No pricing tiers available — quote required or API pricing not returned.")
+                            st.caption(
+                                f"💡 Your Mouser key is set to **{mouser_currency}**. "
+                                "If prices are still missing, log in to your Mouser account → "
+                                "API Settings and confirm the currency matches what you selected here."
+                            )
+
+                    with dcol2:
+                        st.markdown(f"**🔄 Alternative / Substitute Parts**")
+                        alts = detail_result.get("Alternatives", [])
+                        if alts:
+                            st.caption(
+                                f"{len(alts)} alternate packaging variant(s) or suggested replacement(s) "
+                                f"from supplier catalog:"
+                            )
+                            for alt in alts:
+                                icon = "⚑" if alt.startswith("⚑") else "📦"
+                                label = alt.replace("⚑ ", "")
+                                st.markdown(
+                                    f'<span class="alt-chip">{icon} {label}</span>',
+                                    unsafe_allow_html=True
+                                )
+                            st.caption(
+                                "📦 = alternate packaging (tape/reel, bulk, cut-tape). "
+                                "⚑ = manufacturer-suggested replacement for EOL/NRND parts."
+                            )
+                        else:
+                            st.info("No alternatives found for this part in the Mouser catalog.")
+                            if detail_result.get("Status") in ("EOL","Discontinued"):
+                                st.warning(
+                                    "⚠️ This part is EOL/Discontinued but no SuggestedReplacement "
+                                    "was returned by Mouser. Search manually at mouser.com."
+                                )
+
+                # ── Risk factor breakdown ──────────────────────────────────
                 with st.expander("🔍 Risk Factor Details per Part"):
                     rf_rows = []
                     for r in sorted(results, key=lambda x: x.get("RiskScore",0), reverse=True):
                         rf = r.get("RiskFactors", {})
                         rf_rows.append({
-                            "Part Number": r["PartNumber"],
+                            "Part Number":  r["PartNumber"],
                             "Overall Risk": r["RiskScore"],
-                            "Sourcing":    rf.get("Sourcing",""),
-                            "Stock":       rf.get("Stock",""),
-                            "Lead Time":   rf.get("LeadTime",""),
-                            "Lifecycle":   rf.get("Lifecycle",""),
-                            "Geographic":  rf.get("Geographic",""),
-                            "Status":      r["Status"],
-                            "COO":         r["COO"],
+                            "Sourcing":     rf.get("Sourcing",""),
+                            "Stock":        rf.get("Stock",""),
+                            "Lead Time":    rf.get("LeadTime",""),
+                            "Lifecycle":    rf.get("Lifecycle",""),
+                            "Geographic":   rf.get("Geographic",""),
+                            "Status":       r["Status"],
+                            "COO":          r["COO"],
+                            "Alternatives": len(r.get("Alternatives",[])),
                         })
                     rf_df = pd.DataFrame(rf_rows)
                     st.dataframe(rf_df.style.map(color_risk_cell, subset=["Overall Risk"]),
@@ -1287,39 +1412,40 @@ if uploaded:
 
                 # Export
                 export_df = pd.DataFrame([{
-                    "Part Number":    r["PartNumber"],
-                    "Manufacturer":   r["Manufacturer"],
-                    "MfgPN":          r["MfgPN"],
-                    "Description":    r.get("Description",""),
-                    "BOM Qty":        r["QtyNeed"] // total_units,
-                    "Total Qty Needed": r["QtyNeed"],
-                    "Best Supplier":  r["BestCostSrc"],
-                    "Unit Cost ($)":  r.get("BestCostPerRaw",""),
-                    "Total Cost ($)": r.get("BestTotalCostRaw",""),
+                    "Part Number":        r["PartNumber"],
+                    "Manufacturer":       r["Manufacturer"],
+                    "MfgPN":              r["MfgPN"],
+                    "Description":        r.get("Description",""),
+                    "BOM Qty":            r["QtyNeed"] // total_units,
+                    "Total Qty Needed":   r["QtyNeed"],
+                    "Best Supplier":      r["BestCostSrc"],
+                    "Unit Cost ($)":      r.get("BestCostPerRaw",""),
+                    "Total Cost ($)":     r.get("BestTotalCostRaw",""),
                     "Total w/Tariff ($)": r.get("BestTotalWithTariff",""),
-                    "Tariff Rate":    r["TariffPct"],
-                    "Actual Buy Qty": r["ActualBuyQty"],
-                    "Stock Available": r["StockAvail"],
-                    "Lead Time (days)": r["BestCostLT"],
-                    "COO":            r["COO"],
-                    "Status":         r["Status"],
-                    "Risk Score":     r["RiskScore"],
-                    "Sourcing Risk":  r.get("RiskFactors",{}).get("Sourcing",""),
-                    "Stock Risk":     r.get("RiskFactors",{}).get("Stock",""),
-                    "LeadTime Risk":  r.get("RiskFactors",{}).get("LeadTime",""),
-                    "Lifecycle Risk": r.get("RiskFactors",{}).get("Lifecycle",""),
-                    "Geographic Risk": r.get("RiskFactors",{}).get("Geographic",""),
-                    "Datasheet":      r.get("DatasheetUrl",""),
-                    "Notes":          r.get("Notes",""),
+                    "Tariff Rate":        r["TariffPct"],
+                    "Actual Buy Qty":     r["ActualBuyQty"],
+                    "Stock Available":    r["StockAvail"],
+                    "Lead Time (days)":   r["BestCostLT"],
+                    "COO":                r["COO"],
+                    "Status":             r["Status"],
+                    "Risk Score":         r["RiskScore"],
+                    "Sourcing Risk":      r.get("RiskFactors",{}).get("Sourcing",""),
+                    "Stock Risk":         r.get("RiskFactors",{}).get("Stock",""),
+                    "LeadTime Risk":      r.get("RiskFactors",{}).get("LeadTime",""),
+                    "Lifecycle Risk":     r.get("RiskFactors",{}).get("Lifecycle",""),
+                    "Geographic Risk":    r.get("RiskFactors",{}).get("Geographic",""),
+                    "Alternatives":       " | ".join(r.get("Alternatives",[])),
+                    "Datasheet":          r.get("DatasheetUrl",""),
+                    "Notes":              r.get("Notes",""),
                 } for r in results])
                 st.download_button("⬇️ Export Full BOM Analysis CSV",
                     export_df.to_csv(index=False),
                     f"BOM_Analysis_{datetime.now():%Y%m%d_%H%M%S}.csv",
                     "text/csv", use_container_width=True)
 
-            # ── Tab 2: Purchasing Strategies ───────────────────────────────
+            # ── Tab 2: Strategies ──────────────────────────────────────────
             with tab2:
-                st.markdown("Compare the 4 purchasing strategies from the original BOM Analyzer.")
+                st.markdown("Compare the 4 purchasing strategies.")
                 strat_summary = []
                 for sname, sdata in strategies.items():
                     strat_summary.append({
@@ -1330,32 +1456,29 @@ if uploaded:
                     })
                 st.dataframe(pd.DataFrame(strat_summary), use_container_width=True, hide_index=True)
 
-                chosen_strat = st.selectbox("📋 View / Export Strategy Details:",
-                                            list(strategies.keys()))
-                strat_parts = strategies[chosen_strat]["parts"]
-                strat_rows  = []
+                chosen_strat = st.selectbox("📋 View / Export Strategy Details:", list(strategies.keys()))
+                strat_parts  = strategies[chosen_strat]["parts"]
+                strat_rows   = []
                 for pn, opt in strat_parts.items():
                     lt_val = opt.get("lead_time", np.inf)
                     lt_str = f"{lt_val:.0f}" if (pd.notna(lt_val) and not np.isinf(lt_val)) else "In Stock / N/A"
                     strat_rows.append({
-                        "Part Number":   pn,
-                        "Supplier":      opt.get("source","N/A"),
-                        "Unit Cost ($)": opt.get("unit_cost", np.nan),
+                        "Part Number":    pn,
+                        "Supplier":       opt.get("source","N/A"),
+                        "Unit Cost ($)":  opt.get("unit_cost", np.nan),
                         "Total Cost ($)": opt.get("cost", np.nan),
-                        "Qty Order":     opt.get("actual_order_qty","N/A"),
-                        "Stock":         opt.get("stock",0),
-                        "Lead (days)":   lt_str,
-                        "Notes":         opt.get("notes",""),
+                        "Qty Order":      opt.get("actual_order_qty","N/A"),
+                        "Stock":          opt.get("stock",0),
+                        "Lead (days)":    lt_str,
+                        "Notes":          opt.get("notes",""),
                     })
                 strat_df = pd.DataFrame(strat_rows)
                 st.dataframe(strat_df.style.format({
-                    "Unit Cost ($)":  lambda v: f"${v:.4f}" if pd.notna(v) else "N/A",
-                    "Total Cost ($)": lambda v: f"${v:,.2f}" if pd.notna(v) else "N/A",
+                    "Unit Cost ($)":  lambda v: f"{currency_symbol}{v:.4f}" if pd.notna(v) else "N/A",
+                    "Total Cost ($)": lambda v: f"{currency_symbol}{v:,.2f}" if pd.notna(v) else "N/A",
                 }), use_container_width=True, height=450)
-
-                strat_export = strat_df.copy()
                 st.download_button(f"⬇️ Export '{chosen_strat}' Strategy CSV",
-                    strat_export.to_csv(index=False),
+                    strat_df.to_csv(index=False),
                     f"Strategy_{chosen_strat.replace(' ','_')}_{datetime.now():%Y%m%d_%H%M}.csv",
                     "text/csv", use_container_width=True)
 
@@ -1375,8 +1498,7 @@ if uploaded:
                 fig.patch.set_facecolor("#f8f9fa"); ax.set_facecolor("#f8f9fa")
 
                 if chart_type == "Risk Score Distribution":
-                    bins   = [0, 3.5, 6.5, 10]
-                    labels = ["Low (0-3.5)", "Moderate (3.6-6.5)", "High (6.6-10)"]
+                    labels = ["Low (0-3.5)","Moderate (3.6-6.5)","High (6.6-10)"]
                     colors = ["#107c10","#ca5010","#d13438"]
                     counts = [
                         sum(1 for r in results if r.get("RiskScore",0) <= 3.5),
@@ -1393,32 +1515,29 @@ if uploaded:
                     top = sorted(valid_results, key=lambda r: r.get("BestTotalCostRaw",0) or 0, reverse=True)[:20]
                     ax.barh([r["PartNumber"] for r in top],
                             [r.get("BestTotalCostRaw",0) or 0 for r in top], color="#0078d4")
-                    ax.set_xlabel("Extended Cost ($)"); ax.set_title("Top 20 Parts by Cost")
+                    ax.set_xlabel(f"Extended Cost ({currency_symbol})"); ax.set_title("Top 20 Parts by Cost")
 
                 elif chart_type == "Stock vs Qty Needed":
-                    scores  = [r.get("RiskScore",0) for r in results]
-                    x_vals  = [r.get("QtyNeed",0) for r in results]
-                    y_vals  = [r.get("StockAvail",0) for r in results]
-                    sc = ax.scatter(x_vals, y_vals, c=scores, cmap="RdYlGn_r",
-                                   s=80, alpha=0.75, vmin=0, vmax=10)
+                    scores = [r.get("RiskScore",0) for r in results]
+                    x_vals = [r.get("QtyNeed",0) for r in results]
+                    y_vals = [r.get("StockAvail",0) for r in results]
+                    sc = ax.scatter(x_vals, y_vals, c=scores, cmap="RdYlGn_r", s=80, alpha=0.75, vmin=0, vmax=10)
                     mx = max(max(x_vals,default=1), max(y_vals,default=1))*1.1
                     ax.plot([0,mx],[0,mx],"k--",alpha=0.4,label="Stock = Needed")
                     plt.colorbar(sc, ax=ax, label="Risk Score")
                     ax.set_xlabel("Qty Needed"); ax.set_ylabel("Stock Available")
-                    ax.set_title("Stock vs Quantity Needed")
-                    ax.legend()
+                    ax.set_title("Stock vs Quantity Needed"); ax.legend()
 
                 elif chart_type == "Cost + Tariff Impact (Top 15)":
-                    top = sorted(valid_results, key=lambda r: r.get("BestTotalCostRaw",0) or 0, reverse=True)[:15]
+                    top  = sorted(valid_results, key=lambda r: r.get("BestTotalCostRaw",0) or 0, reverse=True)[:15]
                     pns  = [r["PartNumber"] for r in top]
                     base = [r.get("BestTotalCostRaw",0) or 0 for r in top]
-                    tariff_add = [(r.get("BestTotalWithTariff",0) or 0) - (r.get("BestTotalCostRaw",0) or 0) for r in top]
-                    x = range(len(pns))
+                    tariff_add = [(r.get("BestTotalWithTariff",0) or 0)-(r.get("BestTotalCostRaw",0) or 0) for r in top]
+                    x    = range(len(pns))
                     ax.bar(x, base, label="Base Cost", color="#0078d4")
                     ax.bar(x, tariff_add, bottom=base, label="Tariff Add-on", color="#d13438", alpha=0.8)
                     ax.set_xticks(list(x)); ax.set_xticklabels(pns, rotation=45, ha="right", fontsize=8)
-                    ax.set_ylabel("Cost ($)"); ax.set_title("Base Cost vs Tariff Impact")
-                    ax.legend()
+                    ax.set_ylabel(f"Cost ({currency_symbol})"); ax.set_title("Base Cost vs Tariff Impact"); ax.legend()
 
                 elif chart_type == "COO Geographic Risk Map":
                     coo_risk = {}
@@ -1441,10 +1560,10 @@ if uploaded:
                     totals = [strategies[n]["total_cost"] for n in names]
                     colors = ["#0078d4","#107c10","#ca5010","#d13438"]
                     bars   = ax.bar(names, totals, color=colors[:len(names)], width=0.5)
-                    for bar, v in zip(bars,totals):
+                    for bar,v in zip(bars,totals):
                         ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+5,
-                                f"${v:,.0f}", ha="center", fontsize=9, fontweight="bold")
-                    ax.set_ylabel("Total BOM Cost ($)"); ax.set_title("Purchasing Strategy Cost Comparison")
+                                f"{currency_symbol}{v:,.0f}", ha="center", fontsize=9, fontweight="bold")
+                    ax.set_ylabel(f"Total BOM Cost ({currency_symbol})"); ax.set_title("Purchasing Strategy Cost Comparison")
                     ax.set_xticklabels(names, rotation=10, ha="right")
 
                 plt.tight_layout()
@@ -1454,54 +1573,46 @@ if uploaded:
             # ── Tab 4: AI Summary ──────────────────────────────────────────
             with tab4:
                 st.markdown("### 🤖 AI Executive Summary")
-                st.caption(f"Powered by **OpenAI** — {openai_key}")
+                st.caption("Powered by **OpenAI**")
 
                 if not openai_key:
-                    st.warning("Add your OpenAI API key in the sidebar. ")
+                    st.warning("Add your OpenAI API key in the sidebar.")
                 else:
-                    # Build a rich prompt context matching original app's AI logic
-                    high_risk_parts = [r for r in results if r.get("RiskScore",0) >= 6.6]
-                    eol_parts       = [r for r in results if r.get("Status") in ("EOL","Discontinued")]
-                    stock_gap_parts = [r for r in results if r.get("StockAvail",0) < r.get("QtyNeed",0)]
-                    no_price_parts  = [r for r in results if not r.get("_valid")]
+                    high_risk_parts  = [r for r in results if r.get("RiskScore",0) >= 6.6]
+                    eol_parts        = [r for r in results if r.get("Status") in ("EOL","Discontinued")]
+                    stock_gap_parts  = [r for r in results if r.get("StockAvail",0) < r.get("QtyNeed",0)]
+                    no_price_parts   = [r for r in results if not r.get("_valid")]
+                    alt_parts        = [r for r in results if r.get("Alternatives")]
 
                     critical_detail = ""
                     for r in high_risk_parts[:8]:
-                        critical_detail += (f"\n  - {r['PartNumber']}: Risk={r['RiskScore']}, "
-                                            f"Stock={r['StockAvail']}/{r['QtyNeed']} needed, "
-                                            f"LT={r['BestCostLT']} days, Status={r['Status']}, COO={r['COO']}")
+                        critical_detail += (
+                            f"\n  - {r['PartNumber']}: Risk={r['RiskScore']}, "
+                            f"Stock={r['StockAvail']}/{r['QtyNeed']} needed, "
+                            f"LT={r['BestCostLT']} days, Status={r['Status']}, COO={r['COO']}, "
+                            f"Alternatives={len(r.get('Alternatives',[]))}"
+                        )
 
                     strat_summary_text = ""
                     for sname, sdata in strategies.items():
-                        strat_summary_text += f"\n  - {sname}: ${sdata['total_cost']:,.2f} total, max LT {sdata['max_lt']} days"
+                        strat_summary_text += f"\n  - {sname}: {currency_symbol}{sdata['total_cost']:,.2f} total, max LT {sdata['max_lt']} days"
 
                     prompt = f"""Analyze this BOM for a PCB electronics manufacturing team building {total_units} units.
+All costs are in {mouser_currency} ({currency_symbol}).
 
 SUMMARY METRICS:
-- Total Parts: {len(results)}
-- Valid (with pricing): {len(valid_results)}
-- Not Found / No Data: {len(no_price_parts)}
-- Total BOM Cost (best price): ${total_cost_best:,.2f}
-- Total BOM Cost (with tariffs): ${total_cost_tariff:,.2f}
-- Tariff Impact: ${tariff_impact:,.2f}
-- High Risk Parts (≥6.6): {high_risk}
-- Moderate Risk Parts (3.6–6.5): {mod_risk}
-- Low Risk Parts (<3.6): {low_risk}
-- EOL/Discontinued Parts: {eol_count}
-- Parts with Zero Stock: {no_stock}
-- Parts with Stock Gaps: {len(stock_gap_parts)}
+- Total Parts: {len(results)} | Valid (with pricing): {len(valid_results)} | Not Found: {len(no_price_parts)}
+- Total BOM Cost: {currency_symbol}{total_cost_best:,.2f} | With Tariffs: {currency_symbol}{total_cost_tariff:,.2f} | Tariff Impact: {currency_symbol}{tariff_impact:,.2f}
+- High Risk: {high_risk} | Moderate: {mod_risk} | Low: {low_risk}
+- EOL/Discontinued: {eol_count} | Zero Stock: {no_stock} | Stock Gaps: {len(stock_gap_parts)}
+- Parts with Alternatives Available: {len(alt_parts)}
 
-PURCHASING STRATEGIES:
-{strat_summary_text}
+PURCHASING STRATEGIES:{strat_summary_text}
 
-HIGH RISK PARTS DETAIL (risk ≥6.6):
-{critical_detail if critical_detail else 'None'}
+HIGH RISK PARTS (risk ≥6.6):{critical_detail if critical_detail else 'None'}
 
-EOL / DISCONTINUED:
-{", ".join(r["PartNumber"] for r in eol_parts[:10]) or "None"}
-
-PARTS WITH STOCK GAPS:
-{", ".join(r["PartNumber"] for r in stock_gap_parts[:10]) or "None"}
+EOL/DISCONTINUED: {", ".join(r["PartNumber"] for r in eol_parts[:10]) or "None"}
+STOCK GAPS: {", ".join(r["PartNumber"] for r in stock_gap_parts[:10]) or "None"}
 
 Please provide:
 1. **Executive Summary** (2-3 sentences)
@@ -1521,8 +1632,7 @@ Be specific, concise, and actionable. Reference actual part numbers where releva
                         st.markdown(st.session_state["ai_summary"])
                         st.download_button("⬇️ Export AI Summary",
                             st.session_state["ai_summary"],
-                            f"AI_Summary_{datetime.now():%Y%m%d_%H%M%S}.txt",
-                            "text/plain")
+                            f"AI_Summary_{datetime.now():%Y%m%d_%H%M%S}.txt", "text/plain")
 
     except Exception as e:
         st.error(f"Error: {e}")
@@ -1530,5 +1640,6 @@ Be specific, concise, and actionable. Reference actual part numbers where releva
 
 else:
     st.info("👆 Upload a BOM CSV file above to get started. Download the template if you need the format.")
+
 st.divider()
-st.caption("BOM Analyzer Web Edition · CRDV Adaptation Initiative · AI by OpenAI · For PCB Department use")
+st.caption("BOM Analyzer Web Edition v1.2.0 · CRDV Adaptation · AI by OpenAI · For PCB Department use")
