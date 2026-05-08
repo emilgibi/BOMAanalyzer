@@ -1529,37 +1529,6 @@ Be specific, concise, and actionable. Reference actual part numbers where releva
         import traceback; st.code(traceback.format_exc())
 
 else:
-    # Welcome / instructions
     st.info("👆 Upload a BOM CSV file above to get started. Download the template if you need the format.")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown("""
-**What this tool analyzes:**
-- 📡 Real-time pricing, stock & lead times from **Mouser** and **Nexar/Octopart**
-- 💰 Optimal purchase quantities using **price break + buy-up logic** (exact original algorithm)
-- ⚠️ Multi-factor **risk scoring** (Sourcing, Stock, Lead Time, Lifecycle, Geographic) — same weights as desktop app
-- 🌍 **Tariff/duty estimation** by country of origin
-- 📊 **4 purchasing strategies**: Lowest Cost (Strict), Lowest Cost (In Stock), Fastest, Optimized
-- 🤖 **AI executive summary** via OpenAI
-- 📤 Full **CSV export** for every result and strategy
-        """)
-    with col_b:
-        st.markdown("""
-**CSV Format Required:**
-```
-Part Number, Quantity, Manufacturer, Description
-LM358DR, 2, Texas Instruments, Op-Amp Dual
-RMCF0402FT100K, 10, Stackpole, Resistor 100K
-GRM188R71C104KA01D, 4, Murata, Cap 100nF
-```
-`Part Number` and `Quantity` are required.
-`Manufacturer` and `Description` are optional.
-
-**API Keys Needed :**
-- 🔑 [Mouser API](https://www.mouser.com/api-search/) — mouser.com
-- 🔑 [Nexar API](https://nexar.com) — nexar.com
-- 🤖 [OpenAI](https://openai.com/api/) — for AI summary
-        """)
-
 st.divider()
 st.caption("BOM Analyzer Web Edition · CRDV Adaptation Initiative · AI by OpenAI · For PCB Department use")
